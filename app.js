@@ -109,7 +109,10 @@ const productSchema = z.object({
 
 const monitorSchema = z.object({
   job_id: z.string().min(8).max(100),
-  products: z.array(productSchema).min(1)
+  products: z.array(productSchema).min(1),
+  total_products: z.union([z.string(), z.number()]).optional(),
+  batch_index: z.union([z.string(), z.number()]).optional(),
+  total_batches: z.union([z.string(), z.number()]).optional()
 });
 
 const callbackSchema = z.object({
@@ -996,10 +999,10 @@ app.post("/monitor", requireN8n, async (req, res) => {
     }
 
     job.status = "processing";
-    job.total = body.products.length;
-    job.processed = 0;
-    job.ok = 0;
-    job.errors = 0;
+    job.total = Number(body.total_products || job.total || body.products.length);
+    job.processed = Number(job.processed || 0);
+    job.ok = Number(job.ok || 0);
+    job.errors = Number(job.errors || 0);
     job.started_at = job.started_at || nowIso();
     job.finished_at = null;
     job.error = "";
@@ -1030,8 +1033,8 @@ app.post("/monitor", requireN8n, async (req, res) => {
       }
     }
 
-    job.status = "processed";
-    job.finished_at = nowIso();
+    job.status = "processing";
+    job.finished_at = null;
 
     return res.json({
       ok: true,

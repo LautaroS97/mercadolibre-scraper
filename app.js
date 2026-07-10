@@ -42,7 +42,9 @@ const config = {
   meliConcurrency: Number(process.env.MELI_CONCURRENCY || 2),
   meliMinTimeMs: Number(process.env.MELI_MIN_TIME_MS || 700),
   cacheTtlMs: Number(process.env.CACHE_TTL_MS || 1000 * 60 * 60 * 6),
-  httpTimeoutMs: Number(process.env.HTTP_TIMEOUT_MS || 20000)
+  httpTimeoutMs: Number(process.env.HTTP_TIMEOUT_MS || 20000),
+  logProductDetails: String(process.env.LOG_PRODUCT_DETAILS || "false") === "true",
+  logHttpDetails: String(process.env.LOG_HTTP_DETAILS || "true") === "true"
 };
 
 const jobs = new Map();
@@ -124,6 +126,30 @@ const callbackSchema = z.object({
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function logProduct(level, data, message) {
+  const selectedLevel = config.logProductDetails ? level : "debug";
+  logger[selectedLevel](data, message);
+}
+
+function summarizeResponseData(data) {
+  if (data === null || data === undefined) return { type: "empty" };
+  if (Array.isArray(data)) return { type: "array", length: data.length };
+  if (typeof data === "string") {
+    return {
+      type: "string",
+      length: data.length,
+      preview: data.slice(0, 180).replace(/\s+/g, " ")
+    };
+  }
+  if (typeof data === "object") {
+    return {
+      type: "object",
+      keys: Object.keys(data).slice(0, 20)
+    };
+  }
+  return { type: typeof data, value: String(data).slice(0, 180) };
 }
 
 function normalizeEan(value) {
@@ -331,18 +357,38 @@ async function meliRequest(path, options = {}) {
 
     let response = await makeRequest();
 
+    if (config.logHttpDetails) {
+      logger.info({
+        metodo: method,
+        endpoint: path,
+        estado_http: response.status,
+        parametros: params,
+        autenticado: auth,
+        respuesta: summarizeResponseData(response.data)
+      }, "Respuesta recibida desde la API de MercadoLibre");
+    }
+
     if (response.status === 401 && auth && hasMeliCredentials() && meliTokens.refresh_token) {
+      logger.warn({ endpoint: path }, "La API devolvió 401; se intentará renovar el token y repetir la solicitud");
       await refreshMeliToken();
       headers.Authorization = `Bearer ${meliTokens.access_token}`;
       response = await makeRequest();
+      logger.info({ endpoint: path, estado_http: response.status }, "Solicitud repetida después de renovar el token");
     }
 
     if (response.status === 429) {
+      logger.warn({ endpoint: path }, "La API devolvió 429; se esperarán 2 segundos antes de reintentar");
       await sleep(2000);
       response = await makeRequest();
+      logger.info({ endpoint: path, estado_http: response.status }, "Solicitud repetida después del límite de velocidad");
     }
 
     if (response.status >= 400) {
+      logger.error({
+        endpoint: path,
+        estado_http: response.status,
+        respuesta: summarizeResponseData(response.data)
+      }, "La API de MercadoLibre devolvió un error");
       const err = new Error(`meli_api_error_${response.status}`);
       err.status = response.status;
       err.data = response.data;
@@ -460,7 +506,7 @@ function buildOkResult(row, ean, data) {
 async function findCatalogByIdentifier(ean, row) {
   const attempts = [];
 
-  attempts.push(async () => {
+  attempts.push({ nombre: "products_search_por_identificador", ejecutar: async () => {
     const data = await meliRequest("/products/search", {
       params: {
         site_id: config.meliSiteId,
@@ -469,9 +515,9 @@ async function findCatalogByIdentifier(ean, row) {
       }
     });
     return extractResults(data);
-  });
+  }});
 
-  attempts.push(async () => {
+  attempts.push({ nombre: "marketplace_products_search_por_identificador", ejecutar: async () => {
     const data = await meliRequest("/marketplace/products/search", {
       params: {
         site_id: config.meliSiteId,
@@ -480,9 +526,9 @@ async function findCatalogByIdentifier(ean, row) {
       }
     });
     return extractResults(data);
-  });
+  }});
 
-  attempts.push(async () => {
+  attempts.push({ nombre: "sites_search_por_ean", ejecutar: async () => {
     const data = await meliRequest(`/sites/${config.meliSiteId}/search`, {
       params: {
         q: ean,
@@ -490,10 +536,10 @@ async function findCatalogByIdentifier(ean, row) {
       }
     });
     return extractResults(data);
-  });
+  }});
 
   if (row.name) {
-    attempts.push(async () => {
+    attempts.push({ nombre: "sites_search_por_marca_y_nombre", ejecutar: async () => {
       const data = await meliRequest(`/sites/${config.meliSiteId}/search`, {
         params: {
           q: `${row.brand || ""} ${row.name || ""}`.trim(),
@@ -501,12 +547,27 @@ async function findCatalogByIdentifier(ean, row) {
         }
       });
       return extractResults(data);
-    });
+    }});
   }
 
   for (const attempt of attempts) {
     try {
-      const results = await attempt();
+      logProduct("info", {
+        job_id: row.job_id || null,
+        fila: row.row_number,
+        ean,
+        intento: attempt.nombre
+      }, "Comienza un intento de búsqueda por API");
+
+      const results = await attempt.ejecutar();
+
+      logProduct("info", {
+        job_id: row.job_id || null,
+        fila: row.row_number,
+        ean,
+        intento: attempt.nombre,
+        cantidad_resultados: results.length
+      }, "Finalizó un intento de búsqueda por API");
 
       for (const item of results) {
         const catalogId = firstString(
@@ -519,6 +580,14 @@ async function findCatalogByIdentifier(ean, row) {
         const itemId = firstString(item.id && !String(item.id).startsWith("MLA1") ? item.id : "", item.item_id);
 
         if (catalogId) {
+          logProduct("info", {
+            job_id: row.job_id || null,
+            fila: row.row_number,
+            ean,
+            intento: attempt.nombre,
+            catalog_product_id: normalizeCatalogId(catalogId),
+            item_id: normalizeItemId(itemId) || null
+          }, "La API encontró un producto de catálogo");
           return {
             catalog_product_id: normalizeCatalogId(catalogId),
             item_id: normalizeItemId(itemId),
@@ -527,9 +596,24 @@ async function findCatalogByIdentifier(ean, row) {
         }
       }
     } catch (error) {
-      logger.warn({ err: error.message }, "catalog_attempt_failed");
+      logger.warn({
+        job_id: row.job_id || null,
+        fila: row.row_number,
+        ean,
+        intento: attempt.nombre,
+        error: error.message,
+        estado_http: error.status || null,
+        respuesta: summarizeResponseData(error.data)
+      }, "Falló un intento de búsqueda por API");
     }
   }
+
+  logProduct("warn", {
+    job_id: row.job_id || null,
+    fila: row.row_number,
+    ean,
+    intentos_realizados: attempts.map(attempt => attempt.nombre)
+  }, "La API no encontró un producto de catálogo para el EAN");
 
   return null;
 }
@@ -649,13 +733,29 @@ async function scrapeCatalogByEan(ean) {
   const base = getMeliPublicBase();
   const url = `${base}/catalogo/explorar?q=${encodeURIComponent(ean)}`;
 
+  logger.info({ ean, url }, "Comienza la búsqueda pública del producto por EAN");
+
   const response = await http.get(url, {
     headers: {
       Accept: "text/html"
     }
   });
 
-  if (response.status >= 400) return null;
+  const html = String(response.data || "");
+  const contentType = response.headers && response.headers["content-type"] ? response.headers["content-type"] : "";
+
+  logger.info({
+    ean,
+    url,
+    estado_http: response.status,
+    tipo_contenido: contentType,
+    longitud_html: html.length
+  }, "MercadoLibre respondió a la búsqueda pública por EAN");
+
+  if (response.status >= 400) {
+    logger.warn({ ean, url, estado_http: response.status }, "La búsqueda pública devolvió un estado HTTP de error");
+    return null;
+  }
 
   const $ = cheerio.load(response.data);
   let catalogId = "";
@@ -668,12 +768,28 @@ async function scrapeCatalogByEan(ean) {
   });
 
   if (!catalogId) {
-    const html = String(response.data || "");
     const match = html.match(/\/p\/(ML[A-Z]?\d+)/i);
     if (match) catalogId = match[1].toUpperCase();
   }
 
-  if (!catalogId) return null;
+  if (!catalogId) {
+    const title = $("title").text().replace(/\s+/g, " ").trim().slice(0, 200);
+    const possibleBlock = /captcha|robot|access denied|forbidden|demasiadas solicitudes|unusual traffic/i.test(`${title} ${html.slice(0, 5000)}`);
+
+    logger.warn({
+      ean,
+      url,
+      estado_http: response.status,
+      tipo_contenido: contentType,
+      longitud_html: html.length,
+      titulo: title,
+      posible_bloqueo: possibleBlock
+    }, "La búsqueda pública respondió, pero no se encontró un identificador de catálogo en el HTML");
+
+    return null;
+  }
+
+  logger.info({ ean, catalog_product_id: catalogId }, "La búsqueda pública encontró un producto de catálogo");
 
   return {
     catalog_product_id: catalogId,
@@ -750,7 +866,18 @@ async function scrapeOffersByCatalog(catalogProductId) {
 async function resolveProduct(row) {
   const ean = normalizeEan(row.ean);
 
+  logProduct("info", {
+    job_id: row.job_id || null,
+    fila: row.row_number,
+    ean,
+    marca: row.brand || "",
+    nombre: row.name || "",
+    api_conectada: hasMeliToken(),
+    fallback_scraping_habilitado: config.enableScrapingFallback
+  }, "Comienza la resolución de un producto");
+
   if (!isValidEan(ean)) {
+    logProduct("warn", { job_id: row.job_id || null, fila: row.row_number, ean }, "El EAN fue rechazado por formato inválido");
     return resultError(row, ean, "invalid_ean", "EAN inválido");
   }
 
@@ -758,6 +885,7 @@ async function resolveProduct(row) {
   const cached = cacheGet(cacheKey);
 
   if (cached) {
+    logProduct("info", { job_id: row.job_id || null, fila: row.row_number, ean }, "Se utilizará un resultado almacenado en caché");
     return {
       ...cached,
       row_number: row.row_number,
@@ -770,21 +898,34 @@ async function resolveProduct(row) {
 
   if (hasMeliToken()) {
     try {
+      logProduct("info", { job_id: row.job_id || null, fila: row.row_number, ean }, "Se intentará buscar el catálogo mediante la API oficial");
       catalog = await findCatalogByIdentifier(ean, row);
     } catch (error) {
-      logger.warn({ ean, err: error.message }, "api_catalog_lookup_failed");
+      logger.warn({ job_id: row.job_id || null, fila: row.row_number, ean, error: error.message }, "Falló la búsqueda de catálogo mediante la API oficial");
     }
+  } else {
+    logProduct("warn", { job_id: row.job_id || null, fila: row.row_number, ean }, "La búsqueda por API fue omitida porque no hay un token de MercadoLibre disponible");
   }
 
   if (!catalog && config.enableScrapingFallback) {
     try {
+      logProduct("info", { job_id: row.job_id || null, fila: row.row_number, ean }, "Se intentará buscar el catálogo mediante scraping público");
       catalog = await scrapeCatalogByEan(ean);
     } catch (error) {
-      logger.warn({ ean, err: error.message }, "html_catalog_lookup_failed");
+      logger.warn({ job_id: row.job_id || null, fila: row.row_number, ean, error: error.message }, "Falló la búsqueda de catálogo mediante scraping público");
     }
+  } else if (!catalog) {
+    logProduct("warn", { job_id: row.job_id || null, fila: row.row_number, ean }, "El scraping público está deshabilitado y la API no encontró un catálogo");
   }
 
   if (!catalog || !catalog.catalog_product_id) {
+    logProduct("warn", {
+      job_id: row.job_id || null,
+      fila: row.row_number,
+      ean,
+      api_conectada: hasMeliToken(),
+      fallback_scraping_habilitado: config.enableScrapingFallback
+    }, "No se encontró un producto de catálogo después de completar todos los métodos disponibles");
     return resultError(row, ean, "not_found", "No se encontró producto de catálogo");
   }
 
@@ -809,6 +950,13 @@ async function resolveProduct(row) {
   const best = pickBestOffer(offers);
 
   if (!best) {
+    logProduct("warn", {
+      job_id: row.job_id || null,
+      fila: row.row_number,
+      ean,
+      catalog_product_id: catalog.catalog_product_id,
+      cantidad_ofertas: offers.length
+    }, "Se encontró el catálogo, pero no hubo ofertas válidas con precio y enlace");
     return resultError(row, ean, "no_offers", "No se encontraron ofertas con precio y link");
   }
 
@@ -823,6 +971,17 @@ async function resolveProduct(row) {
   });
 
   cacheSet(cacheKey, result);
+
+  logProduct("info", {
+    job_id: row.job_id || null,
+    fila: row.row_number,
+    ean,
+    catalog_product_id: result.catalog_product_id,
+    item_id: result.item_id,
+    precio_minimo: result.min_price,
+    vendidos: result.sold,
+    fuente: result.source
+  }, "El producto fue resuelto correctamente");
 
   return result;
 }
@@ -1007,11 +1166,21 @@ app.post("/monitor", requireN8n, async (req, res) => {
     job.finished_at = null;
     job.error = "";
 
+    logger.info({
+      job_id: body.job_id,
+      indice_tanda: body.batch_index || null,
+      total_tandas: body.total_batches || null,
+      productos_en_tanda: body.products.length,
+      total_productos: body.total_products || null,
+      api_conectada: hasMeliToken(),
+      fallback_scraping_habilitado: config.enableScrapingFallback
+    }, "Comienza el procesamiento de una tanda");
+
     const results = [];
 
     for (const row of body.products) {
       try {
-        const result = await resolveProduct(row);
+        const result = await resolveProduct({ ...row, job_id: body.job_id });
         results.push(result);
 
         job.processed += 1;
@@ -1035,6 +1204,26 @@ app.post("/monitor", requireN8n, async (req, res) => {
 
     job.status = "processing";
     job.finished_at = null;
+
+    const batchOk = results.filter(result => result.status === "ok").length;
+    const batchNotFound = results.filter(result => result.status === "not_found").length;
+    const batchNoOffers = results.filter(result => result.status === "no_offers").length;
+    const batchInvalid = results.filter(result => result.status === "invalid_ean").length;
+    const batchUnexpected = results.filter(result => result.status === "unexpected_error").length;
+
+    logger.info({
+      job_id: body.job_id,
+      indice_tanda: body.batch_index || null,
+      productos_en_tanda: body.products.length,
+      correctos: batchOk,
+      no_encontrados: batchNotFound,
+      sin_ofertas: batchNoOffers,
+      ean_invalidos: batchInvalid,
+      errores_inesperados: batchUnexpected,
+      progreso_total: job.processed,
+      correctos_totales: job.ok,
+      errores_totales: job.errors
+    }, "Finalizó el procesamiento de una tanda");
 
     return res.json({
       ok: true,
@@ -1073,6 +1262,16 @@ app.post("/n8n/callback", requireN8n, (req, res) => {
 
   job.status = body.status;
   job.finished_at = nowIso();
+
+  logger.info({
+    job_id: body.job_id,
+    estado_final: body.status,
+    filas_actualizadas: body.updated_rows,
+    procesados: job.processed,
+    correctos: job.ok,
+    errores: job.errors,
+    error_reportado: body.error || ""
+  }, "n8n informó la finalización del job");
 
   if (body.error) {
     job.error = body.error;
@@ -1211,6 +1410,9 @@ app.listen(config.port, () => {
   logger.info({
     port: config.port,
     site: config.meliSiteId,
-    scraping_fallback: config.enableScrapingFallback
-  }, "meli-monitor-service_started");
+    scraping_fallback: config.enableScrapingFallback,
+    api_conectada: hasMeliToken(),
+    log_detalle_productos: config.logProductDetails,
+    log_detalle_http: config.logHttpDetails
+  }, "Microservicio de monitoreo de MercadoLibre iniciado");
 });

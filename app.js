@@ -44,12 +44,14 @@ const config = {
   cacheTtlMs: Number(process.env.CACHE_TTL_MS || 1000 * 60 * 60 * 6),
   httpTimeoutMs: Number(process.env.HTTP_TIMEOUT_MS || 20000),
   logProductDetails: String(process.env.LOG_PRODUCT_DETAILS || "false") === "true",
-  logHttpDetails: String(process.env.LOG_HTTP_DETAILS || "true") === "true"
+  logHttpDetails: String(process.env.LOG_HTTP_DETAILS || "true") === "true",
+  maxHtmlDiagnosticLogs: Number(process.env.MAX_HTML_DIAGNOSTIC_LOGS || 5)
 };
 
 const jobs = new Map();
 const productCache = new Map();
 const authStates = new Map();
+let htmlDiagnosticLogs = 0;
 
 let meliTokens = {
   access_token: process.env.MELI_ACCESS_TOKEN || "",
@@ -733,7 +735,7 @@ async function scrapeCatalogByEan(ean) {
   const base = getMeliPublicBase();
   const url = `${base}/catalogo/explorar?q=${encodeURIComponent(ean)}`;
 
-  logger.info({ ean, url }, "Comienza la búsqueda pública del producto por EAN");
+  logger.debug({ ean, url }, "Comienza la búsqueda pública del producto por EAN");
 
   const response = await http.get(url, {
     headers: {
@@ -744,7 +746,7 @@ async function scrapeCatalogByEan(ean) {
   const html = String(response.data || "");
   const contentType = response.headers && response.headers["content-type"] ? response.headers["content-type"] : "";
 
-  logger.info({
+  logger.debug({
     ean,
     url,
     estado_http: response.status,
@@ -774,22 +776,42 @@ async function scrapeCatalogByEan(ean) {
 
   if (!catalogId) {
     const title = $("title").text().replace(/\s+/g, " ").trim().slice(0, 200);
-    const possibleBlock = /captcha|robot|access denied|forbidden|demasiadas solicitudes|unusual traffic/i.test(`${title} ${html.slice(0, 5000)}`);
+    const bodyText = $("body").text().replace(/\s+/g, " ").trim();
+    const finalUrl = response.request?.res?.responseUrl || url;
+    const diagnosticText = `${title} ${bodyText.slice(0, 1500)} ${html.slice(0, 5000)}`;
+    const possibleBlock = /captcha|robot|access denied|forbidden|demasiadas solicitudes|unusual traffic|tráfico inusual|verificá que sos humano|verifica que eres humano/i.test(diagnosticText);
+    const containsCatalogData = /catalog_product_id|catalogProductId|\/p\/ML[A-Z]?\d+/i.test(html);
+    const containsSearchData = /search-results|ui-search|poly-card|results/i.test(html);
 
-    logger.warn({
-      ean,
-      url,
-      estado_http: response.status,
-      tipo_contenido: contentType,
-      longitud_html: html.length,
-      titulo: title,
-      posible_bloqueo: possibleBlock
-    }, "La búsqueda pública respondió, pero no se encontró un identificador de catálogo en el HTML");
+    if (htmlDiagnosticLogs < config.maxHtmlDiagnosticLogs) {
+      htmlDiagnosticLogs += 1;
+      logger.warn({
+        ean,
+        url_solicitada: url,
+        url_final: finalUrl,
+        estado_http: response.status,
+        tipo_contenido: contentType,
+        longitud_html: html.length,
+        titulo: title,
+        inicio_texto: bodyText.slice(0, 500),
+        posible_bloqueo: possibleBlock,
+        contiene_datos_catalogo: containsCatalogData,
+        contiene_datos_resultados: containsSearchData,
+        diagnostico_numero: htmlDiagnosticLogs,
+        diagnosticos_maximos: config.maxHtmlDiagnosticLogs
+      }, "Diagnóstico del HTML recibido desde MercadoLibre sin identificador de catálogo");
+    } else {
+      logger.debug({
+        ean,
+        estado_http: response.status,
+        longitud_html: html.length
+      }, "La búsqueda pública no encontró un identificador de catálogo");
+    }
 
     return null;
   }
 
-  logger.info({ ean, catalog_product_id: catalogId }, "La búsqueda pública encontró un producto de catálogo");
+  logger.debug({ ean, catalog_product_id: catalogId }, "La búsqueda pública encontró un producto de catálogo");
 
   return {
     catalog_product_id: catalogId,

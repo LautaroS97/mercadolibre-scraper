@@ -43,14 +43,16 @@ const config = {
   meliMinTimeMs: Number(process.env.MELI_MIN_TIME_MS || 700),
   cacheTtlMs: Number(process.env.CACHE_TTL_MS || 1000 * 60 * 60 * 6),
   httpTimeoutMs: Number(process.env.HTTP_TIMEOUT_MS || 20000),
-  maxApiDiagnosticLogs: Number(process.env.MAX_API_DIAGNOSTIC_LOGS || 10),
+  maxApiDiagnosticLogs: Number(process.env.MAX_API_DIAGNOSTIC_LOGS || 20),
   requireApiPreflight: String(process.env.REQUIRE_API_PREFLIGHT || "true") === "true",
-  enableNameFallback: String(process.env.ENABLE_NAME_FALLBACK || "true") === "true",
-  maxSearchResults: Number(process.env.MELI_MAX_SEARCH_RESULTS || 50),
-  maxItemDetails: Number(process.env.MELI_MAX_ITEM_DETAILS || 10),
+  enableSiteEanFallback: String(process.env.ENABLE_SITE_EAN_FALLBACK || "false") === "true",
+  enableCatalogSearchFallback: String(process.env.ENABLE_CATALOG_SEARCH_FALLBACK || "true") === "true",
+  catalogItemsPageSize: Math.max(1, Math.min(50, Number(process.env.MELI_CATALOG_ITEMS_PAGE_SIZE || 50))),
+  maxCatalogItemPages: Math.max(1, Math.min(20, Number(process.env.MELI_MAX_CATALOG_ITEM_PAGES || 10))),
+  cacheSuccessfulResults: String(process.env.CACHE_SUCCESSFUL_RESULTS || "true") === "true",
+  logCatalogSamples: String(process.env.LOG_CATALOG_SAMPLES || "true") === "true",
   tokenRefreshLeadMs: Number(process.env.MELI_TOKEN_REFRESH_LEAD_MS || 1000 * 60 * 60),
-  tokenCheckIntervalMs: Number(process.env.MELI_TOKEN_CHECK_INTERVAL_MS || 1000 * 60 * 10),
-  usePublicItemDetail: String(process.env.MELI_PUBLIC_ITEM_DETAIL || "true") === "true"
+  tokenCheckIntervalMs: Number(process.env.MELI_TOKEN_CHECK_INTERVAL_MS || 1000 * 60 * 10)
 };
 
 const jobs = new Map();
@@ -83,7 +85,7 @@ const meliLimiter = new Bottleneck({
 const http = axios.create({
   timeout: config.httpTimeoutMs,
   headers: {
-    "User-Agent": "MeliMonitorService/2.0",
+    "User-Agent": "MeliMonitorService/3.0",
     "Accept-Language": "es-AR,es;q=0.9,en;q=0.8"
   },
   maxRedirects: 3,
@@ -661,6 +663,7 @@ function extractResults(data) {
   if (Array.isArray(data.results)) return data.results;
   if (Array.isArray(data.items)) return data.items;
   if (Array.isArray(data.products)) return data.products;
+  if (Array.isArray(data.offers)) return data.offers;
   if (Array.isArray(data)) return data;
   return [];
 }
@@ -673,10 +676,31 @@ function firstString(...values) {
   return "";
 }
 
+function firstNumber(...values) {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    const parsed = parsePrice(value);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
 function parsePrice(value) {
-  if (value === null || value === undefined) return null;
+  if (value === null || value === undefined || value === "") return null;
   if (typeof value === "number" && Number.isFinite(value)) return value;
-  const clean = String(value)
+  if (typeof value === "object") {
+    return firstNumber(
+      value.amount,
+      value.value,
+      value.price,
+      value.current_price,
+      value.sale_price,
+      value.display_amount
+    );
+  }
+  const text = String(value).trim();
+  if (!text) return null;
+  const clean = text
     .replace(/[^\d,.-]/g, "")
     .replace(/\.(?=\d{3}(\D|$))/g, "")
     .replace(",", ".");
@@ -696,6 +720,236 @@ function normalizeItemId(value) {
   return match ? match[0].toUpperCase() : "";
 }
 
+function getPath(object, path) {
+  if (!object || typeof object !== "object") return undefined;
+  const parts = Array.isArray(path) ? path : String(path).split(".");
+  let current = object;
+  for (const part of parts) {
+    if (current === null || current === undefined) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function firstPath(object, paths) {
+  for (const path of paths) {
+    const value = getPath(object, path);
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function deepFindValue(object, acceptedKeys, maxDepth = 4) {
+  const keys = new Set(acceptedKeys.map(key => String(key).toLowerCase()));
+  const visited = new Set();
+
+  function visit(value, depth) {
+    if (!value || typeof value !== "object" || depth > maxDepth || visited.has(value)) return undefined;
+    visited.add(value);
+
+    for (const [key, child] of Object.entries(value)) {
+      if (keys.has(key.toLowerCase()) && child !== undefined && child !== null && child !== "") {
+        return child;
+      }
+    }
+
+    for (const child of Object.values(value)) {
+      if (Array.isArray(child)) {
+        for (const entry of child.slice(0, 5)) {
+          const found = visit(entry, depth + 1);
+          if (found !== undefined) return found;
+        }
+      } else if (child && typeof child === "object") {
+        const found = visit(child, depth + 1);
+        if (found !== undefined) return found;
+      }
+    }
+
+    return undefined;
+  }
+
+  return visit(object, 0);
+}
+
+function normalizeStatus(value) {
+  return firstString(value).toLowerCase();
+}
+
+function normalizeCurrency(value) {
+  return firstString(value).toUpperCase();
+}
+
+function normalizeSold(value) {
+  const number = firstNumber(value);
+  if (number === null || number < 0) return null;
+  return Math.trunc(number);
+}
+
+function normalizeCatalogProduct(raw) {
+  if (!raw || typeof raw !== "object") return null;
+
+  const catalogProductId = normalizeCatalogId(firstString(
+    raw.catalog_product_id,
+    raw.catalogProductId,
+    raw.product_id,
+    raw.productId,
+    raw.id
+  ));
+
+  if (!catalogProductId) return null;
+
+  return {
+    catalog_product_id: catalogProductId,
+    title: firstString(raw.name, raw.title),
+    raw
+  };
+}
+
+function normalizeCatalogOffer(raw, catalogProductId, source) {
+  if (!raw || typeof raw !== "object") return null;
+
+  const itemId = normalizeItemId(firstString(
+    firstPath(raw, [
+      "item_id",
+      "itemId",
+      "id",
+      "item.id",
+      "item.item_id",
+      "offer.item_id",
+      "offer.id"
+    ]),
+    deepFindValue(raw, ["item_id", "itemId"], 3)
+  ));
+
+  const priceValue = firstPath(raw, [
+    "price",
+    "amount",
+    "current_price",
+    "currentPrice",
+    "sale_price",
+    "salePrice",
+    "price.amount",
+    "sale_price.amount",
+    "salePrice.amount",
+    "prices.presentation.display_amount",
+    "prices.presentation.displayAmount",
+    "offer.price",
+    "offer.price.amount",
+    "item.price"
+  ]);
+
+  const deepPriceValue = priceValue === undefined
+    ? deepFindValue(raw, ["current_price", "sale_price", "display_amount", "price"], 4)
+    : undefined;
+
+  const soldValue = firstPath(raw, [
+    "sold_quantity",
+    "soldQuantity",
+    "sold",
+    "sales.quantity",
+    "sales.sold_quantity",
+    "item.sold_quantity",
+    "offer.sold_quantity"
+  ]);
+
+  const deepSoldValue = soldValue === undefined
+    ? deepFindValue(raw, ["sold_quantity", "soldQuantity"], 4)
+    : undefined;
+
+  const status = normalizeStatus(firstPath(raw, [
+    "status",
+    "item.status",
+    "offer.status"
+  ]));
+
+  const currency = normalizeCurrency(firstPath(raw, [
+    "currency_id",
+    "currencyId",
+    "currency",
+    "price.currency_id",
+    "price.currencyId",
+    "sale_price.currency_id",
+    "item.currency_id",
+    "offer.currency_id"
+  ]));
+
+  const link = firstString(firstPath(raw, [
+    "permalink",
+    "link",
+    "url",
+    "item.permalink",
+    "item.url",
+    "offer.permalink"
+  ]));
+
+  if (!itemId) return null;
+
+  const sold = normalizeSold(soldValue === undefined ? deepSoldValue : soldValue);
+
+  return {
+    item_id: itemId,
+    catalog_product_id: catalogProductId || normalizeCatalogId(raw.catalog_product_id) || null,
+    price: firstNumber(priceValue, deepPriceValue),
+    currency_id: currency || null,
+    status: status || null,
+    link: link || null,
+    sold,
+    sold_source: sold !== null ? "catalog_items_api" : "not_available",
+    source,
+    raw
+  };
+}
+
+function summarizeRawOffer(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const summary = {
+    keys: Object.keys(raw).slice(0, 30)
+  };
+  const candidates = [
+    "id",
+    "item_id",
+    "itemId",
+    "price",
+    "amount",
+    "current_price",
+    "sale_price",
+    "sold_quantity",
+    "status",
+    "currency_id",
+    "permalink"
+  ];
+  for (const key of candidates) {
+    if (raw[key] !== undefined) summary[key] = raw[key];
+  }
+  if (raw.item && typeof raw.item === "object") {
+    summary.item_keys = Object.keys(raw.item).slice(0, 20);
+  }
+  if (raw.price && typeof raw.price === "object") {
+    summary.price_keys = Object.keys(raw.price).slice(0, 20);
+  }
+  if (raw.sale_price && typeof raw.sale_price === "object") {
+    summary.sale_price_keys = Object.keys(raw.sale_price).slice(0, 20);
+  }
+  return summary;
+}
+
+function extractPaging(data, fallbackOffset, fallbackLimit, received) {
+  const paging = data && typeof data === "object" && data.paging && typeof data.paging === "object"
+    ? data.paging
+    : {};
+  const total = firstNumber(paging.total, data?.total);
+  const offset = firstNumber(paging.offset, data?.offset, fallbackOffset) ?? fallbackOffset;
+  const limit = firstNumber(paging.limit, data?.limit, fallbackLimit) ?? fallbackLimit;
+  const nextOffset = offset + received;
+  return {
+    total,
+    offset,
+    limit,
+    next_offset: nextOffset,
+    has_more: total !== null ? nextOffset < total : received >= limit
+  };
+}
+
 function resultError(row, ean, status, error, details = {}) {
   return {
     row_number: row.row_number,
@@ -703,10 +957,11 @@ function resultError(row, ean, status, error, details = {}) {
     catalog_product_id: details.catalog_product_id || null,
     item_id: details.item_id || null,
     min_price: null,
-    link: null,
+    link: details.link || details.item_id || null,
+    mla: details.item_id || null,
     sold: null,
     sold_source: "not_available",
-    source: "mercadolibre_api",
+    source: details.source || "mercadolibre_api",
     status,
     error: error ? String(error).slice(0, 500) : "",
     api_http_status: details.api_http_status || null,
@@ -717,19 +972,22 @@ function resultError(row, ean, status, error, details = {}) {
   };
 }
 
-function buildOkResult(row, ean, data) {
+function buildResolvedResult(row, ean, data) {
+  const status = data.sold === null || data.sold === undefined ? "partial_ok" : "ok";
   return {
     row_number: row.row_number,
     ean,
     catalog_product_id: data.catalog_product_id || null,
     item_id: data.item_id || null,
     min_price: data.min_price === undefined ? null : data.min_price,
-    link: data.link || null,
+    link: data.link || data.item_id || null,
+    mla: data.item_id || null,
     sold: data.sold === undefined ? null : data.sold,
     sold_source: data.sold_source || "not_available",
     source: data.source || "mercadolibre_api",
-    status: "ok",
+    status,
     error: "",
+    warning: status === "partial_ok" ? "MercadoLibre no informó la cantidad vendida para la publicación de menor precio" : "",
     api_http_status: 200,
     api_endpoint: data.api_endpoint || null,
     retryable: false,
@@ -738,87 +996,108 @@ function buildOkResult(row, ean, data) {
   };
 }
 
-function normalizeSearchItem(raw) {
-  if (!raw || typeof raw !== "object") return null;
-
-  const itemId = normalizeItemId(firstString(raw.id, raw.item_id, raw.itemId));
-  const catalogProductId = normalizeCatalogId(firstString(raw.catalog_product_id, raw.catalogProductId, raw.product_id));
-  const price = parsePrice(raw.price ?? raw.amount ?? raw.current_price);
-  const link = firstString(raw.permalink, raw.link, raw.url);
-  const sold = typeof raw.sold_quantity === "number" ? raw.sold_quantity : null;
-  const title = firstString(raw.title, raw.name);
-
-  if (!itemId && !catalogProductId && price === null && !link) return null;
-
+function buildCatalogOnlyResult(row, ean, data) {
   return {
-    item_id: itemId || null,
-    catalog_product_id: catalogProductId || null,
-    price,
-    link: link || null,
-    sold,
-    sold_source: sold !== null ? "api_reference" : "not_available",
-    title,
-    raw
+    row_number: row.row_number,
+    ean,
+    catalog_product_id: data.catalog_product_id || null,
+    item_id: data.item_id || null,
+    min_price: null,
+    link: data.item_id || null,
+    mla: data.item_id || null,
+    sold: data.sold === undefined ? null : data.sold,
+    sold_source: data.sold_source || "not_available",
+    source: data.source || "catalog_items_api",
+    status: "catalog_only",
+    error: "MercadoLibre informó publicaciones MLA asociadas, pero no expuso un precio utilizable",
+    api_http_status: 200,
+    api_endpoint: data.api_endpoint || null,
+    retryable: false,
+    requires_reauthorization: false,
+    checked_at: nowIso()
   };
 }
 
-async function searchApi(path, params, operation) {
-  const data = await meliRequest(path, {
-    params,
-    operation,
-    maxRetries: 1
-  });
-  return extractResults(data).map(normalizeSearchItem).filter(Boolean);
-}
-
 async function searchProductsByEan(ean) {
-  const attempts = [
-    {
-      path: "/products/search",
-      operation: "buscar_producto_por_identificador",
-      params: {
-        site_id: config.meliSiteId,
-        product_identifier: ean,
-        status: "active"
-      }
-    },
-    {
-      path: "/marketplace/products/search",
-      operation: "buscar_producto_marketplace_por_identificador",
-      params: {
-        site_id: config.meliSiteId,
-        product_identifier: ean,
-        status: "active"
-      }
-    },
-    {
-      path: `/sites/${config.meliSiteId}/search`,
-      operation: "buscar_publicaciones_por_ean",
-      params: {
-        q: ean,
-        limit: config.maxSearchResults
-      }
-    }
-  ];
-
   const errors = [];
+  const exactPath = "/products/search";
 
-  for (const attempt of attempts) {
+  try {
+    const data = await meliRequest(exactPath, {
+      params: {
+        site_id: config.meliSiteId,
+        product_identifier: ean,
+        status: "active"
+      },
+      operation: "buscar_producto_catalogo_por_identificador",
+      maxRetries: 1
+    });
+
+    const results = extractResults(data).map(normalizeCatalogProduct).filter(Boolean);
+
+    logger.info({
+      ean,
+      endpoint: exactPath,
+      productos_catalogo_encontrados: results.length,
+      catalog_product_ids: results.slice(0, 5).map(result => result.catalog_product_id)
+    }, "Finalizó la búsqueda exacta del producto por UPC/EAN");
+
+    if (results.length) {
+      return {
+        results,
+        endpoint: exactPath,
+        operation: "buscar_producto_catalogo_por_identificador",
+        errors
+      };
+    }
+  } catch (error) {
+    errors.push(error);
+    logger.warn({
+      ean,
+      endpoint: exactPath,
+      codigo: error.code || "api_error",
+      estado_http: error.status || null
+    }, "Falló la búsqueda exacta del producto por UPC/EAN");
+
+    if (["api_unauthorized", "api_not_authenticated", "api_reauthorization_required"].includes(error.code)) {
+      throw error;
+    }
+  }
+
+  if (config.enableSiteEanFallback) {
+    const fallbackPath = `/sites/${config.meliSiteId}/search`;
     try {
-      const results = await searchApi(attempt.path, attempt.params, attempt.operation);
+      const data = await meliRequest(fallbackPath, {
+        params: {
+          q: ean,
+          limit: config.catalogItemsPageSize
+        },
+        operation: "buscar_publicaciones_publicas_por_ean",
+        maxRetries: 1,
+        auth: false
+      });
 
-      logger.debug({
+      const rawResults = extractResults(data);
+      const results = rawResults
+        .map(raw => ({
+          catalog_product_id: normalizeCatalogId(raw.catalog_product_id),
+          title: firstString(raw.title, raw.name),
+          raw
+        }))
+        .filter(result => result.catalog_product_id);
+
+      logger.info({
         ean,
-        operacion: attempt.operation,
-        endpoint: attempt.path,
-        cantidad_resultados: results.length
-      }, "Finalizó un intento de búsqueda del producto mediante la API");
+        endpoint: fallbackPath,
+        resultados_publicos: rawResults.length,
+        productos_catalogo_encontrados: results.length
+      }, "Finalizó la búsqueda pública alternativa por UPC/EAN");
 
       if (results.length) {
         return {
           results,
-          endpoint: attempt.path,
-          operation: attempt.operation,
+          endpoint: fallbackPath,
+          operation: "buscar_publicaciones_publicas_por_ean",
           errors
         };
       }
@@ -826,17 +1105,10 @@ async function searchProductsByEan(ean) {
       errors.push(error);
       logger.warn({
         ean,
-        operacion: attempt.operation,
-        endpoint: attempt.path,
+        endpoint: fallbackPath,
         codigo: error.code || "api_error",
-        estado_http: error.status || null,
-        reintentable: Boolean(error.retryable),
-        requiere_reautorizacion: Boolean(error.requires_reauthorization)
-      }, "Falló un método de búsqueda del producto mediante la API");
-
-      if (error.code === "api_unauthorized" || error.code === "api_not_authenticated" || error.code === "api_reauthorization_required") {
-        throw error;
-      }
+        estado_http: error.status || null
+      }, "Falló la búsqueda pública alternativa por UPC/EAN");
     }
   }
 
@@ -848,230 +1120,218 @@ async function searchProductsByEan(ean) {
   };
 }
 
-async function searchProductsByName(row) {
-  if (!config.enableNameFallback) return { results: [], endpoint: null, operation: null, errors: [] };
+async function fetchCatalogOffers(catalogProductId) {
+  const path = `/products/${catalogProductId}/items`;
+  const rawOffers = [];
+  const normalizedOffers = [];
+  const errors = [];
+  const seenItemIds = new Set();
+  let offset = 0;
+  let pagesRead = 0;
+  let lastPaging = null;
 
-  const query = `${row.brand || ""} ${row.name || ""}`.replace(/\s+/g, " ").trim();
-  if (query.length < 3) return { results: [], endpoint: null, operation: null, errors: [] };
-
-  const path = `/sites/${config.meliSiteId}/search`;
-
-  try {
-    const results = await searchApi(path, {
-      q: query,
-      limit: config.maxSearchResults
-    }, "buscar_publicaciones_por_nombre");
-
-    logger.debug({
-      row_number: row.row_number,
-      consulta: query.slice(0, 200),
-      cantidad_resultados: results.length
-    }, "Finalizó la búsqueda alternativa por marca y nombre");
-
-    return {
-      results,
-      endpoint: path,
-      operation: "buscar_publicaciones_por_nombre",
-      errors: []
-    };
-  } catch (error) {
-    logger.warn({
-      row_number: row.row_number,
-      codigo: error.code || "api_error",
-      estado_http: error.status || null
-    }, "Falló la búsqueda alternativa por marca y nombre");
-
-    return {
-      results: [],
-      endpoint: path,
-      operation: "buscar_publicaciones_por_nombre",
-      errors: [error]
-    };
-  }
-}
-
-async function getItemDetail(itemId) {
-  if (!itemId) {
-    return {
-      ok: false,
-      error: apiError("Falta item_id", {
-        code: "invalid_item_id",
-        status: 400,
-        endpoint: null,
-        retryable: false,
-        requires_reauthorization: false
-      })
-    };
-  }
-
-  const path = `/items/${itemId}`;
-  const authModes = config.usePublicItemDetail ? [false, true] : [true, false];
-  const attempts = [];
-
-  for (const auth of authModes) {
+  for (let page = 0; page < config.maxCatalogItemPages; page += 1) {
     try {
-      const item = await meliRequest(path, {
-        params: { include_attributes: "all" },
-        operation: auth ? "obtener_detalle_publicacion_autenticado" : "obtener_detalle_publicacion_publico",
-        maxRetries: 1,
-        auth
+      const data = await meliRequest(path, {
+        params: {
+          limit: config.catalogItemsPageSize,
+          offset
+        },
+        operation: "listar_publicaciones_del_producto_catalogo",
+        maxRetries: 1
       });
 
-      const value = {
-        item_id: normalizeItemId(item.id || itemId) || itemId,
-        catalog_product_id: normalizeCatalogId(item.catalog_product_id) || null,
-        price: parsePrice(item.price),
-        link: firstString(item.permalink),
-        sold: typeof item.sold_quantity === "number" ? item.sold_quantity : null,
-        sold_source: typeof item.sold_quantity === "number" ? "api_reference" : "not_available",
-        source: auth ? "api_item_detail_authenticated" : "api_item_detail_public",
-        api_endpoint: path
-      };
+      const pageRaw = extractResults(data);
+      const pageNormalized = pageRaw
+        .map(raw => normalizeCatalogOffer(raw, catalogProductId, "catalog_items_api"))
+        .filter(Boolean);
 
-      logger.debug({
-        item_id: value.item_id,
-        autenticado: auth,
-        precio_presente: value.price !== null,
-        enlace_presente: Boolean(value.link)
-      }, "Se obtuvo el detalle de una publicación");
-
-      return { ok: true, value };
-    } catch (error) {
-      attempts.push(error);
-      logger.warn({
-        item_id: itemId,
-        endpoint: path,
-        autenticado: auth,
-        codigo: error.code || "api_error",
-        estado_http: error.status || null,
-        detalle: error.data || error.message
-      }, "No se pudo obtener el detalle de una publicación");
-
-      if (![401, 403].includes(Number(error.status || 0))) {
-        return { ok: false, error };
+      for (const raw of pageRaw) rawOffers.push(raw);
+      for (const offer of pageNormalized) {
+        if (seenItemIds.has(offer.item_id)) continue;
+        seenItemIds.add(offer.item_id);
+        normalizedOffers.push(offer);
       }
-    }
-  }
 
-  return { ok: false, error: attempts[attempts.length - 1] || apiError("No se pudo obtener el detalle de la publicación", {
-    code: "api_item_detail_failed",
-    status: 502,
-    endpoint: path,
-    retryable: false,
-    requires_reauthorization: false
-  }) };
-}
+      lastPaging = extractPaging(data, offset, config.catalogItemsPageSize, pageRaw.length);
+      pagesRead += 1;
 
-async function findOffersByCatalogApi(catalogProductId) {
-  if (!catalogProductId) return { offers: [], errors: [] };
-
-  const attempts = [
-    {
-      path: `/products/${catalogProductId}/items`,
-      operation: "buscar_ofertas_por_producto_catalogo",
-      params: { limit: config.maxSearchResults }
-    },
-    {
-      path: `/sites/${config.meliSiteId}/search`,
-      operation: "buscar_publicaciones_por_catalog_product_id",
-      params: {
+      logger.info({
         catalog_product_id: catalogProductId,
-        limit: config.maxSearchResults
-      }
-    }
-  ];
+        endpoint: path,
+        pagina: page + 1,
+        offset,
+        recibidos: pageRaw.length,
+        normalizados: pageNormalized.length,
+        total_acumulado: normalizedOffers.length,
+        paging: lastPaging
+      }, "Se obtuvo una página de publicaciones asociadas al producto de catálogo");
 
-  const errors = [];
-
-  for (const attempt of attempts) {
-    try {
-      const results = await searchApi(attempt.path, attempt.params, attempt.operation);
-      if (results.length) {
-        return {
-          offers: results,
-          endpoint: attempt.path,
-          errors
-        };
-      }
+      if (pageRaw.length === 0 || !lastPaging.has_more || lastPaging.next_offset <= offset) break;
+      offset = lastPaging.next_offset;
     } catch (error) {
       errors.push(error);
       logger.warn({
         catalog_product_id: catalogProductId,
-        operacion: attempt.operation,
-        endpoint: attempt.path,
+        endpoint: path,
+        pagina: page + 1,
+        offset,
         codigo: error.code || "api_error",
         estado_http: error.status || null
-      }, "Falló un método de búsqueda de ofertas mediante la API");
-
-      if (error.code === "api_unauthorized" || error.code === "api_not_authenticated" || error.code === "api_reauthorization_required") {
-        throw error;
-      }
+      }, "Falló la lectura de publicaciones asociadas al producto de catálogo");
+      break;
     }
   }
 
-  return { offers: [], endpoint: null, errors };
+  if (config.logCatalogSamples && rawOffers.length) {
+    logger.info({
+      catalog_product_id: catalogProductId,
+      endpoint: path,
+      paginas_leidas: pagesRead,
+      publicaciones_unicas: normalizedOffers.length,
+      muestra_estructura: rawOffers.slice(0, 3).map(summarizeRawOffer),
+      muestra_normalizada: normalizedOffers.slice(0, 5).map(offer => ({
+        item_id: offer.item_id,
+        price: offer.price,
+        currency_id: offer.currency_id,
+        status: offer.status,
+        sold: offer.sold,
+        link_presente: Boolean(offer.link)
+      }))
+    }, "Diagnóstico de la respuesta de publicaciones del producto de catálogo");
+  }
+
+  return {
+    offers: normalizedOffers,
+    raw_offers: rawOffers,
+    endpoint: path,
+    paging: lastPaging,
+    pages_read: pagesRead,
+    errors
+  };
 }
 
-async function enrichOffers(offers) {
-  const enriched = [];
-  const errors = [];
-  const limitedOffers = offers.slice(0, Math.max(1, config.maxItemDetails));
-
-  for (const offer of limitedOffers) {
-    if (!offer.item_id) {
-      enriched.push({
-        item_id: null,
-        catalog_product_id: offer.catalog_product_id || null,
-        price: offer.price,
-        link: offer.link,
-        sold: offer.sold,
-        sold_source: offer.sold_source,
-        source: "api_search"
-      });
-      continue;
-    }
-
-    const detailResult = await getItemDetail(offer.item_id);
-
-    if (!detailResult.ok) {
-      errors.push(detailResult.error);
-      enriched.push({
-        item_id: offer.item_id,
-        catalog_product_id: offer.catalog_product_id || null,
-        price: offer.price,
-        link: offer.link,
-        sold: offer.sold,
-        sold_source: offer.sold_source,
-        source: "api_search_detail_failed"
-      });
-
-      if (["api_unauthorized", "api_not_authenticated", "api_reauthorization_required", "api_forbidden"].includes(detailResult.error.code)) {
-        break;
-      }
-
-      continue;
-    }
-
-    const detail = detailResult.value;
-    enriched.push({
-      item_id: offer.item_id,
-      catalog_product_id: offer.catalog_product_id || detail.catalog_product_id || null,
-      price: detail.price !== null ? detail.price : offer.price,
-      link: detail.link || offer.link,
-      sold: detail.sold !== null ? detail.sold : offer.sold,
-      sold_source: detail.sold !== null ? detail.sold_source : offer.sold_source,
-      source: detail.source,
-      api_endpoint: detail.api_endpoint
-    });
+async function fetchCatalogSearchOffers(catalogProductId) {
+  if (!config.enableCatalogSearchFallback) {
+    return { offers: [], endpoint: null, errors: [], pages_read: 0 };
   }
 
-  return { offers: enriched, errors };
+  const path = `/sites/${config.meliSiteId}/search`;
+  const offers = [];
+  const errors = [];
+  const seenItemIds = new Set();
+  let offset = 0;
+  let pagesRead = 0;
+
+  for (let page = 0; page < config.maxCatalogItemPages; page += 1) {
+    try {
+      const data = await meliRequest(path, {
+        params: {
+          catalog_product_id: catalogProductId,
+          limit: config.catalogItemsPageSize,
+          offset
+        },
+        operation: "buscar_publicaciones_publicas_por_producto_catalogo",
+        maxRetries: 1,
+        auth: false
+      });
+
+      const pageRaw = extractResults(data);
+      const pageOffers = pageRaw
+        .map(raw => normalizeCatalogOffer(raw, catalogProductId, "public_catalog_search_api"))
+        .filter(Boolean);
+
+      for (const offer of pageOffers) {
+        if (seenItemIds.has(offer.item_id)) continue;
+        seenItemIds.add(offer.item_id);
+        offers.push(offer);
+      }
+
+      const paging = extractPaging(data, offset, config.catalogItemsPageSize, pageRaw.length);
+      pagesRead += 1;
+
+      logger.info({
+        catalog_product_id: catalogProductId,
+        endpoint: path,
+        pagina: page + 1,
+        offset,
+        recibidos: pageRaw.length,
+        normalizados: pageOffers.length,
+        total_acumulado: offers.length,
+        paging
+      }, "Se obtuvo una página de la búsqueda pública por producto de catálogo");
+
+      if (pageRaw.length === 0 || !paging.has_more || paging.next_offset <= offset) break;
+      offset = paging.next_offset;
+    } catch (error) {
+      errors.push(error);
+      logger.warn({
+        catalog_product_id: catalogProductId,
+        endpoint: path,
+        pagina: page + 1,
+        offset,
+        codigo: error.code || "api_error",
+        estado_http: error.status || null
+      }, "Falló la búsqueda pública por producto de catálogo");
+      break;
+    }
+  }
+
+  return { offers, endpoint: path, errors, pages_read: pagesRead };
+}
+
+function mergeOffers(...lists) {
+  const byItemId = new Map();
+
+  for (const list of lists) {
+    for (const offer of list || []) {
+      if (!offer || !offer.item_id) continue;
+      const existing = byItemId.get(offer.item_id);
+      if (!existing) {
+        byItemId.set(offer.item_id, offer);
+        continue;
+      }
+
+      byItemId.set(offer.item_id, {
+        ...existing,
+        price: existing.price !== null ? existing.price : offer.price,
+        currency_id: existing.currency_id || offer.currency_id,
+        status: existing.status || offer.status,
+        link: existing.link || offer.link,
+        sold: existing.sold !== null ? existing.sold : offer.sold,
+        sold_source: existing.sold !== null ? existing.sold_source : offer.sold_source,
+        source: `${existing.source}+${offer.source}`,
+        raw: existing.raw
+      });
+    }
+  }
+
+  return [...byItemId.values()];
+}
+
+function isOfferActive(offer) {
+  if (!offer || !offer.item_id) return false;
+  if (!offer.status) return true;
+  return ["active", "under_review"].includes(offer.status);
+}
+
+function isOfferCurrencyAllowed(offer) {
+  if (!offer.currency_id) return true;
+  return offer.currency_id === "ARS";
 }
 
 function pickBestOffer(offers) {
-  return offers
-    .filter(offer => offer && offer.price !== null && offer.price !== undefined && offer.link)
-    .sort((a, b) => Number(a.price) - Number(b.price))[0] || null;
+  return (offers || [])
+    .filter(offer => isOfferActive(offer))
+    .filter(offer => isOfferCurrencyAllowed(offer))
+    .filter(offer => offer.price !== null && offer.price !== undefined && Number(offer.price) > 0)
+    .sort((a, b) => {
+      const priceDifference = Number(a.price) - Number(b.price);
+      if (priceDifference !== 0) return priceDifference;
+      const aSold = a.sold === null ? -1 : Number(a.sold);
+      const bSold = b.sold === null ? -1 : Number(b.sold);
+      return bSold - aSold;
+    })[0] || null;
 }
 
 function firstCriticalApiError(errors) {
@@ -1080,7 +1340,6 @@ function firstCriticalApiError(errors) {
     "api_unauthorized",
     "api_not_authenticated",
     "api_reauthorization_required",
-    "api_forbidden",
     "api_rate_limited",
     "api_unavailable",
     "api_network_error"
@@ -1104,7 +1363,7 @@ async function resolveProduct(row) {
     return resultError(row, ean, "invalid_ean", "EAN inválido");
   }
 
-  const cacheKey = `api:${config.meliSiteId}:ean:${ean}`;
+  const cacheKey = `api-v3:${config.meliSiteId}:ean:${ean}`;
   const cached = cacheGet(cacheKey);
 
   if (cached) {
@@ -1122,10 +1381,10 @@ async function resolveProduct(row) {
     });
   }
 
-  let eanSearch;
+  let productSearch;
 
   try {
-    eanSearch = await searchProductsByEan(ean);
+    productSearch = await searchProductsByEan(ean);
   } catch (error) {
     return resultError(row, ean, error.code || "api_error", error.message, {
       api_http_status: error.status,
@@ -1135,32 +1394,12 @@ async function resolveProduct(row) {
     });
   }
 
-  let candidates = eanSearch.results;
-  let sourceEndpoint = eanSearch.endpoint;
-  let lookupSource = "api_ean_search";
-  const accumulatedErrors = [...eanSearch.errors];
+  const accumulatedErrors = [...productSearch.errors];
 
-  if (!candidates.length) {
-    const nameSearch = await searchProductsByName(row);
-    accumulatedErrors.push(...nameSearch.errors);
-    candidates = nameSearch.results;
-    sourceEndpoint = nameSearch.endpoint;
-    lookupSource = "api_name_search";
-  }
-
-  if (!candidates.length) {
+  if (!productSearch.results.length) {
     const critical = firstCriticalApiError(accumulatedErrors);
 
     if (critical) {
-      logApiDiagnostic({
-        row_number: row.row_number,
-        ean,
-        codigo: critical.code,
-        estado_http: critical.status || null,
-        endpoint: critical.endpoint || null,
-        reintentable: Boolean(critical.retryable)
-      }, "La búsqueda del producto no pudo completarse por un error de la API");
-
       return resultError(row, ean, critical.code || "api_error", critical.message, {
         api_http_status: critical.status,
         api_endpoint: critical.endpoint,
@@ -1173,102 +1412,134 @@ async function resolveProduct(row) {
       row_number: row.row_number,
       ean,
       marca: row.brand || "",
-      nombre: String(row.name || "").slice(0, 200),
-      busqueda_por_nombre_habilitada: config.enableNameFallback
-    }, "La API no encontró coincidencias para el producto");
+      nombre: String(row.name || "").slice(0, 200)
+    }, "La API no encontró un producto de catálogo para el UPC/EAN");
 
-    return resultError(row, ean, "product_not_found", "La API de MercadoLibre no encontró coincidencias para el producto", {
-      api_endpoint: sourceEndpoint
+    return resultError(row, ean, "product_not_found", "La API de MercadoLibre no encontró un producto de catálogo para el UPC/EAN", {
+      api_endpoint: productSearch.endpoint
     });
   }
 
-  const catalogProductId = candidates.map(candidate => candidate.catalog_product_id).find(Boolean) || null;
-  let offers = candidates;
-  let offersEndpoint = sourceEndpoint;
+  const catalogProductId = productSearch.results[0].catalog_product_id;
+  let catalogResult;
 
-  if (catalogProductId) {
-    try {
-      const catalogOffers = await findOffersByCatalogApi(catalogProductId);
-      accumulatedErrors.push(...catalogOffers.errors);
-      if (catalogOffers.offers.length) {
-        offers = catalogOffers.offers;
-        offersEndpoint = catalogOffers.endpoint;
-        lookupSource = "api_catalog_offers";
-      }
-    } catch (error) {
-      return resultError(row, ean, error.code || "api_error", error.message, {
-        catalog_product_id: catalogProductId,
-        api_http_status: error.status,
-        api_endpoint: error.endpoint,
-        retryable: error.retryable,
-        requires_reauthorization: error.requires_reauthorization
-      });
-    }
-  }
-
-  const enrichment = await enrichOffers(offers);
-  const enrichedOffers = enrichment.offers;
-  accumulatedErrors.push(...enrichment.errors);
-  const best = pickBestOffer(enrichedOffers);
-
-  if (!best) {
-    const critical = firstCriticalApiError(accumulatedErrors);
-
-    if (critical) {
-      const failedItem = enrichedOffers.find(offer => offer && offer.item_id)?.item_id || offers.find(offer => offer && offer.item_id)?.item_id || null;
-      return resultError(row, ean, critical.code || "api_error", critical.message, {
-        catalog_product_id: catalogProductId,
-        item_id: failedItem,
-        api_http_status: critical.status,
-        api_endpoint: critical.endpoint,
-        retryable: critical.retryable,
-        requires_reauthorization: critical.requires_reauthorization
-      });
-    }
-
-    logApiDiagnostic({
-      row_number: row.row_number,
-      ean,
+  try {
+    catalogResult = await fetchCatalogOffers(catalogProductId);
+  } catch (error) {
+    return resultError(row, ean, error.code || "api_error", error.message, {
       catalog_product_id: catalogProductId,
-      candidatos_encontrados: candidates.length,
-      ofertas_recibidas: offers.length,
-      ofertas_evaluadas: enrichedOffers.length,
-      ofertas_con_precio: enrichedOffers.filter(offer => offer.price !== null && offer.price !== undefined).length,
-      ofertas_con_enlace: enrichedOffers.filter(offer => Boolean(offer.link)).length,
-      errores_detalle: enrichment.errors.length
-    }, "La API encontró el producto, pero no devolvió una oferta válida con precio y enlace");
-
-    return resultError(row, ean, "offers_not_found", "La API encontró coincidencias, pero no una oferta válida con precio y enlace", {
-      catalog_product_id: catalogProductId,
-      api_endpoint: offersEndpoint
+      api_http_status: error.status,
+      api_endpoint: error.endpoint,
+      retryable: error.retryable,
+      requires_reauthorization: error.requires_reauthorization
     });
   }
 
-  const result = buildOkResult(row, ean, {
-    catalog_product_id: best.catalog_product_id || catalogProductId,
-    item_id: best.item_id || null,
-    min_price: best.price,
-    link: best.link,
-    sold: best.sold,
-    sold_source: best.sold_source,
-    source: best.source || lookupSource,
-    api_endpoint: offersEndpoint || sourceEndpoint
-  });
+  accumulatedErrors.push(...catalogResult.errors);
+  let fallbackResult = { offers: [], endpoint: null, errors: [], pages_read: 0 };
+  let offers = catalogResult.offers;
+  let offersEndpoint = catalogResult.endpoint;
+
+  if (!pickBestOffer(offers) && config.enableCatalogSearchFallback) {
+    fallbackResult = await fetchCatalogSearchOffers(catalogProductId);
+    accumulatedErrors.push(...fallbackResult.errors);
+    offers = mergeOffers(catalogResult.offers, fallbackResult.offers);
+    if (fallbackResult.offers.length) offersEndpoint = fallbackResult.endpoint;
+  }
+
+  const best = pickBestOffer(offers);
+  const itemCandidates = offers.filter(offer => offer.item_id);
+  const firstItem = itemCandidates[0] || null;
 
   logger.info({
     row_number: row.row_number,
     ean,
-    catalog_product_id: result.catalog_product_id,
-    item_id: result.item_id,
-    min_price: result.min_price,
-    link: result.link,
-    sold: result.sold,
-    source: result.source,
-    api_endpoint: result.api_endpoint
-  }, "Producto resuelto correctamente mediante la API de MercadoLibre");
+    catalog_product_id: catalogProductId,
+    publicaciones_catalogo: catalogResult.offers.length,
+    publicaciones_fallback: fallbackResult.offers.length,
+    publicaciones_unicas: offers.length,
+    publicaciones_activas: offers.filter(isOfferActive).length,
+    publicaciones_con_precio: offers.filter(offer => offer.price !== null && offer.price !== undefined && Number(offer.price) > 0).length,
+    publicaciones_con_vendidos: offers.filter(offer => offer.sold !== null && offer.sold !== undefined).length,
+    monedas: [...new Set(offers.map(offer => offer.currency_id).filter(Boolean))],
+    endpoint_seleccionado: offersEndpoint,
+    mejor_item_id: best?.item_id || null,
+    menor_precio: best?.price ?? null,
+    vendidos_mejor_oferta: best?.sold ?? null
+  }, "Finalizó la evaluación de publicaciones para calcular el menor precio");
 
-  cacheSet(cacheKey, result);
-  return result;
+  if (best) {
+    const result = buildResolvedResult(row, ean, {
+      catalog_product_id: catalogProductId,
+      item_id: best.item_id,
+      min_price: best.price,
+      link: best.item_id,
+      sold: best.sold,
+      sold_source: best.sold_source,
+      source: best.source,
+      api_endpoint: offersEndpoint
+    });
+
+    logger.info({
+      row_number: row.row_number,
+      ean,
+      catalog_product_id: catalogProductId,
+      item_id: result.item_id,
+      meli_price: result.min_price,
+      sold: result.sold,
+      status: result.status,
+      source: result.source,
+      api_endpoint: result.api_endpoint
+    }, "Producto resuelto con la publicación de menor precio disponible");
+
+    if (config.cacheSuccessfulResults) cacheSet(cacheKey, result);
+    return result;
+  }
+
+  const critical = firstCriticalApiError(accumulatedErrors);
+
+  if (critical && !firstItem) {
+    return resultError(row, ean, critical.code || "api_error", critical.message, {
+      catalog_product_id: catalogProductId,
+      api_http_status: critical.status,
+      api_endpoint: critical.endpoint,
+      retryable: critical.retryable,
+      requires_reauthorization: critical.requires_reauthorization
+    });
+  }
+
+  if (firstItem) {
+    logApiDiagnostic({
+      row_number: row.row_number,
+      ean,
+      catalog_product_id: catalogProductId,
+      item_id: firstItem.item_id,
+      publicaciones_recibidas: offers.length,
+      publicaciones_con_precio: offers.filter(offer => offer.price !== null && offer.price !== undefined).length,
+      muestra_normalizada: offers.slice(0, 5).map(offer => ({
+        item_id: offer.item_id,
+        price: offer.price,
+        currency_id: offer.currency_id,
+        status: offer.status,
+        sold: offer.sold,
+        source: offer.source
+      }))
+    }, "MercadoLibre informó MLA asociados, pero no expuso un precio utilizable");
+
+    return buildCatalogOnlyResult(row, ean, {
+      catalog_product_id: catalogProductId,
+      item_id: firstItem.item_id,
+      sold: firstItem.sold,
+      sold_source: firstItem.sold_source,
+      source: firstItem.source,
+      api_endpoint: offersEndpoint
+    });
+  }
+
+  return resultError(row, ean, "offers_not_found", "MercadoLibre reconoció el producto, pero no informó publicaciones MLA asociadas", {
+    catalog_product_id: catalogProductId,
+    api_endpoint: offersEndpoint
+  });
 }
 
 async function notifyN8nJobCreated(job) {
@@ -1302,6 +1573,9 @@ function countBatchResults(results) {
   const summary = {
     processed: results.length,
     ok: 0,
+    full_ok: 0,
+    partial_ok: 0,
+    catalog_only: 0,
     product_not_found: 0,
     offers_not_found: 0,
     invalid_ean: 0,
@@ -1310,12 +1584,25 @@ function countBatchResults(results) {
   };
 
   for (const result of results) {
-    if (result.status === "ok") summary.ok += 1;
-    else if (result.status === "product_not_found") summary.product_not_found += 1;
-    else if (result.status === "offers_not_found") summary.offers_not_found += 1;
-    else if (result.status === "invalid_ean") summary.invalid_ean += 1;
-    else if (String(result.status || "").startsWith("api_")) summary.api_errors += 1;
-    else summary.other_errors += 1;
+    if (result.status === "ok") {
+      summary.ok += 1;
+      summary.full_ok += 1;
+    } else if (result.status === "partial_ok") {
+      summary.ok += 1;
+      summary.partial_ok += 1;
+    } else if (result.status === "catalog_only") {
+      summary.catalog_only += 1;
+    } else if (result.status === "product_not_found") {
+      summary.product_not_found += 1;
+    } else if (result.status === "offers_not_found") {
+      summary.offers_not_found += 1;
+    } else if (result.status === "invalid_ean") {
+      summary.invalid_ean += 1;
+    } else if (String(result.status || "").startsWith("api_")) {
+      summary.api_errors += 1;
+    } else {
+      summary.other_errors += 1;
+    }
   }
 
   return summary;
@@ -1405,8 +1692,8 @@ app.post("/meli/test-product", requireN8n, async (req, res) => {
     name: parsed.data.name
   });
 
-  return res.status(result.status === "ok" ? 200 : 404).json({
-    ok: result.status === "ok",
+  return res.status(["ok", "partial_ok"].includes(result.status) ? 200 : 404).json({
+    ok: ["ok", "partial_ok"].includes(result.status),
     result
   });
 });
@@ -1605,9 +1892,9 @@ app.post("/monitor", requireN8n, async (req, res) => {
     job.processed += summary.processed;
     job.ok += summary.ok;
     job.not_found += summary.product_not_found;
-    job.no_offers += summary.offers_not_found;
+    job.no_offers += summary.offers_not_found + summary.catalog_only;
     job.api_errors += summary.api_errors;
-    job.errors += summary.product_not_found + summary.offers_not_found + summary.invalid_ean + summary.api_errors + summary.other_errors;
+    job.errors += summary.catalog_only + summary.product_not_found + summary.offers_not_found + summary.invalid_ean + summary.api_errors + summary.other_errors;
 
     logger.info({
       job_id: job.job_id,
@@ -1615,6 +1902,9 @@ app.post("/monitor", requireN8n, async (req, res) => {
       total_tandas: totalBatches,
       procesados: summary.processed,
       correctos: summary.ok,
+      correctos_completos: summary.full_ok,
+      correctos_parciales: summary.partial_ok,
+      solo_catalogo: summary.catalog_only,
       productos_no_encontrados: summary.product_not_found,
       productos_sin_ofertas: summary.offers_not_found,
       ean_invalidos: summary.invalid_ean,
@@ -1833,8 +2123,8 @@ app.post("/debug/resolve", async (req, res) => {
 
     const result = await resolveProduct(row);
 
-    return res.status(result.status === "ok" ? 200 : 404).json({
-      ok: result.status === "ok",
+    return res.status(["ok", "partial_ok"].includes(result.status) ? 200 : 404).json({
+      ok: ["ok", "partial_ok"].includes(result.status),
       result
     });
   } catch (error) {
@@ -1878,9 +2168,12 @@ app.listen(config.port, async () => {
     concurrencia: config.meliConcurrency,
     intervalo_minimo_ms: config.meliMinTimeMs,
     preflight_obligatorio: config.requireApiPreflight,
-    busqueda_alternativa_por_nombre: config.enableNameFallback,
-    maximo_detalles_por_producto: config.maxItemDetails,
-    detalle_publico_habilitado: config.usePublicItemDetail,
+    fallback_publico_por_ean: config.enableSiteEanFallback,
+    fallback_publico_por_catalogo: config.enableCatalogSearchFallback,
+    tamano_pagina_catalogo: config.catalogItemsPageSize,
+    maximo_paginas_catalogo: config.maxCatalogItemPages,
+    cache_resultados_exitosos: config.cacheSuccessfulResults,
+    logs_muestra_catalogo: config.logCatalogSamples,
     anticipacion_renovacion_ms: config.tokenRefreshLeadMs,
     intervalo_revision_token_ms: config.tokenCheckIntervalMs
   }, "Microservicio iniciado en modo exclusivo API de MercadoLibre");

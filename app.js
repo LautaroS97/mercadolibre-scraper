@@ -46,7 +46,11 @@ const config = {
   maxApiDiagnosticLogs: Number(process.env.MAX_API_DIAGNOSTIC_LOGS || 10),
   requireApiPreflight: String(process.env.REQUIRE_API_PREFLIGHT || "true") === "true",
   enableNameFallback: String(process.env.ENABLE_NAME_FALLBACK || "true") === "true",
-  maxSearchResults: Number(process.env.MELI_MAX_SEARCH_RESULTS || 50)
+  maxSearchResults: Number(process.env.MELI_MAX_SEARCH_RESULTS || 50),
+  maxItemDetails: Number(process.env.MELI_MAX_ITEM_DETAILS || 10),
+  tokenRefreshLeadMs: Number(process.env.MELI_TOKEN_REFRESH_LEAD_MS || 1000 * 60 * 60),
+  tokenCheckIntervalMs: Number(process.env.MELI_TOKEN_CHECK_INTERVAL_MS || 1000 * 60 * 10),
+  usePublicItemDetail: String(process.env.MELI_PUBLIC_ITEM_DETAIL || "true") === "true"
 };
 
 const jobs = new Map();
@@ -69,6 +73,7 @@ let apiVerificationCache = {
   error: ""
 };
 let apiDiagnosticCount = 0;
+let lastTokenRefreshWarningAt = 0;
 
 const meliLimiter = new Bottleneck({
   maxConcurrent: config.meliConcurrency,
@@ -272,7 +277,7 @@ function hasMeliToken() {
 function tokenWillExpireSoon() {
   if (!meliTokens.access_token) return true;
   if (!meliTokens.expires_at) return false;
-  return Date.now() > meliTokens.expires_at - 1000 * 60 * 5;
+  return Date.now() > meliTokens.expires_at - config.tokenRefreshLeadMs;
 }
 
 function tokenExpired() {
@@ -347,7 +352,8 @@ async function exchangeMeliToken(payload) {
   logger.info({
     user_id: meliTokens.user_id || null,
     expires_at: new Date(meliTokens.expires_at).toISOString(),
-    refresh_token_presente: Boolean(meliTokens.refresh_token)
+    refresh_token_presente: Boolean(meliTokens.refresh_token),
+    campos_respuesta: Object.keys(data).filter(key => !["access_token", "refresh_token"].includes(key))
   }, "El token OAuth de MercadoLibre fue actualizado correctamente");
 
   return meliTokens;
@@ -406,6 +412,37 @@ async function ensureMeliToken() {
   }
 
   return meliTokens.access_token;
+}
+
+async function checkAndRefreshMeliToken() {
+  if (!hasMeliToken() || !tokenWillExpireSoon()) return;
+
+  if (!meliTokens.refresh_token) {
+    const now = Date.now();
+    if (now - lastTokenRefreshWarningAt >= config.tokenCheckIntervalMs) {
+      lastTokenRefreshWarningAt = now;
+      logger.warn({
+        token_vencido: tokenExpired(),
+        expires_at: meliTokens.expires_at ? new Date(meliTokens.expires_at).toISOString() : null,
+        oauth_start_url: `${config.appBaseUrl}/auth/mercadolibre/start`
+      }, "El token necesita renovación, pero no hay refresh token disponible");
+    }
+    return;
+  }
+
+  try {
+    await refreshMeliToken();
+    logger.info({
+      expires_at: meliTokens.expires_at ? new Date(meliTokens.expires_at).toISOString() : null
+    }, "El token de MercadoLibre fue renovado preventivamente");
+  } catch (error) {
+    logger.error({
+      codigo: error.code || "token_refresh_error",
+      estado_http: error.status || null,
+      requiere_reautorizacion: Boolean(error.requires_reauthorization),
+      error: error.message
+    }, "Falló la renovación preventiva del token de MercadoLibre");
+  }
 }
 
 async function meliRequest(path, options = {}) {
@@ -854,32 +891,75 @@ async function searchProductsByName(row) {
 }
 
 async function getItemDetail(itemId) {
-  if (!itemId) return null;
-
-  try {
-    const item = await meliRequest(`/items/${itemId}`, {
-      params: { include_attributes: "all" },
-      operation: "obtener_detalle_publicacion",
-      maxRetries: 1
-    });
-
+  if (!itemId) {
     return {
-      item_id: normalizeItemId(item.id || itemId) || itemId,
-      catalog_product_id: normalizeCatalogId(item.catalog_product_id) || null,
-      price: parsePrice(item.price),
-      link: firstString(item.permalink),
-      sold: typeof item.sold_quantity === "number" ? item.sold_quantity : null,
-      sold_source: typeof item.sold_quantity === "number" ? "api_reference" : "not_available",
-      source: "api_item_detail"
+      ok: false,
+      error: apiError("Falta item_id", {
+        code: "invalid_item_id",
+        status: 400,
+        endpoint: null,
+        retryable: false,
+        requires_reauthorization: false
+      })
     };
-  } catch (error) {
-    logger.warn({
-      item_id: itemId,
-      codigo: error.code || "api_error",
-      estado_http: error.status || null
-    }, "No se pudo obtener el detalle de una publicación");
-    return null;
   }
+
+  const path = `/items/${itemId}`;
+  const authModes = config.usePublicItemDetail ? [false, true] : [true, false];
+  const attempts = [];
+
+  for (const auth of authModes) {
+    try {
+      const item = await meliRequest(path, {
+        params: { include_attributes: "all" },
+        operation: auth ? "obtener_detalle_publicacion_autenticado" : "obtener_detalle_publicacion_publico",
+        maxRetries: 1,
+        auth
+      });
+
+      const value = {
+        item_id: normalizeItemId(item.id || itemId) || itemId,
+        catalog_product_id: normalizeCatalogId(item.catalog_product_id) || null,
+        price: parsePrice(item.price),
+        link: firstString(item.permalink),
+        sold: typeof item.sold_quantity === "number" ? item.sold_quantity : null,
+        sold_source: typeof item.sold_quantity === "number" ? "api_reference" : "not_available",
+        source: auth ? "api_item_detail_authenticated" : "api_item_detail_public",
+        api_endpoint: path
+      };
+
+      logger.debug({
+        item_id: value.item_id,
+        autenticado: auth,
+        precio_presente: value.price !== null,
+        enlace_presente: Boolean(value.link)
+      }, "Se obtuvo el detalle de una publicación");
+
+      return { ok: true, value };
+    } catch (error) {
+      attempts.push(error);
+      logger.warn({
+        item_id: itemId,
+        endpoint: path,
+        autenticado: auth,
+        codigo: error.code || "api_error",
+        estado_http: error.status || null,
+        detalle: error.data || error.message
+      }, "No se pudo obtener el detalle de una publicación");
+
+      if (![401, 403].includes(Number(error.status || 0))) {
+        return { ok: false, error };
+      }
+    }
+  }
+
+  return { ok: false, error: attempts[attempts.length - 1] || apiError("No se pudo obtener el detalle de la publicación", {
+    code: "api_item_detail_failed",
+    status: 502,
+    endpoint: path,
+    retryable: false,
+    requires_reauthorization: false
+  }) };
 }
 
 async function findOffersByCatalogApi(catalogProductId) {
@@ -934,20 +1014,11 @@ async function findOffersByCatalogApi(catalogProductId) {
 
 async function enrichOffers(offers) {
   const enriched = [];
+  const errors = [];
+  const limitedOffers = offers.slice(0, Math.max(1, config.maxItemDetails));
 
-  for (const offer of offers) {
-    if (offer.item_id) {
-      const detail = await getItemDetail(offer.item_id);
-      enriched.push({
-        item_id: offer.item_id,
-        catalog_product_id: offer.catalog_product_id || detail?.catalog_product_id || null,
-        price: detail && detail.price !== null ? detail.price : offer.price,
-        link: detail && detail.link ? detail.link : offer.link,
-        sold: detail && detail.sold !== null ? detail.sold : offer.sold,
-        sold_source: detail && detail.sold !== null ? detail.sold_source : offer.sold_source,
-        source: detail ? "api_item_detail" : "api_search"
-      });
-    } else {
+  for (const offer of limitedOffers) {
+    if (!offer.item_id) {
       enriched.push({
         item_id: null,
         catalog_product_id: offer.catalog_product_id || null,
@@ -957,10 +1028,44 @@ async function enrichOffers(offers) {
         sold_source: offer.sold_source,
         source: "api_search"
       });
+      continue;
     }
+
+    const detailResult = await getItemDetail(offer.item_id);
+
+    if (!detailResult.ok) {
+      errors.push(detailResult.error);
+      enriched.push({
+        item_id: offer.item_id,
+        catalog_product_id: offer.catalog_product_id || null,
+        price: offer.price,
+        link: offer.link,
+        sold: offer.sold,
+        sold_source: offer.sold_source,
+        source: "api_search_detail_failed"
+      });
+
+      if (["api_unauthorized", "api_not_authenticated", "api_reauthorization_required", "api_forbidden"].includes(detailResult.error.code)) {
+        break;
+      }
+
+      continue;
+    }
+
+    const detail = detailResult.value;
+    enriched.push({
+      item_id: offer.item_id,
+      catalog_product_id: offer.catalog_product_id || detail.catalog_product_id || null,
+      price: detail.price !== null ? detail.price : offer.price,
+      link: detail.link || offer.link,
+      sold: detail.sold !== null ? detail.sold : offer.sold,
+      sold_source: detail.sold !== null ? detail.sold_source : offer.sold_source,
+      source: detail.source,
+      api_endpoint: detail.api_endpoint
+    });
   }
 
-  return enriched;
+  return { offers: enriched, errors };
 }
 
 function pickBestOffer(offers) {
@@ -1101,15 +1206,19 @@ async function resolveProduct(row) {
     }
   }
 
-  const enrichedOffers = await enrichOffers(offers.slice(0, config.maxSearchResults));
+  const enrichment = await enrichOffers(offers);
+  const enrichedOffers = enrichment.offers;
+  accumulatedErrors.push(...enrichment.errors);
   const best = pickBestOffer(enrichedOffers);
 
   if (!best) {
     const critical = firstCriticalApiError(accumulatedErrors);
 
     if (critical) {
+      const failedItem = enrichedOffers.find(offer => offer && offer.item_id)?.item_id || offers.find(offer => offer && offer.item_id)?.item_id || null;
       return resultError(row, ean, critical.code || "api_error", critical.message, {
         catalog_product_id: catalogProductId,
+        item_id: failedItem,
         api_http_status: critical.status,
         api_endpoint: critical.endpoint,
         retryable: critical.retryable,
@@ -1122,7 +1231,11 @@ async function resolveProduct(row) {
       ean,
       catalog_product_id: catalogProductId,
       candidatos_encontrados: candidates.length,
-      ofertas_evaluadas: enrichedOffers.length
+      ofertas_recibidas: offers.length,
+      ofertas_evaluadas: enrichedOffers.length,
+      ofertas_con_precio: enrichedOffers.filter(offer => offer.price !== null && offer.price !== undefined).length,
+      ofertas_con_enlace: enrichedOffers.filter(offer => Boolean(offer.link)).length,
+      errores_detalle: enrichment.errors.length
     }, "La API encontró el producto, pero no devolvió una oferta válida con precio y enlace");
 
     return resultError(row, ean, "offers_not_found", "La API encontró coincidencias, pero no una oferta válida con precio y enlace", {
@@ -1141,6 +1254,18 @@ async function resolveProduct(row) {
     source: best.source || lookupSource,
     api_endpoint: offersEndpoint || sourceEndpoint
   });
+
+  logger.info({
+    row_number: row.row_number,
+    ean,
+    catalog_product_id: result.catalog_product_id,
+    item_id: result.item_id,
+    min_price: result.min_price,
+    link: result.link,
+    sold: result.sold,
+    source: result.source,
+    api_endpoint: result.api_endpoint
+  }, "Producto resuelto correctamente mediante la API de MercadoLibre");
 
   cacheSet(cacheKey, result);
   return result;
@@ -1222,6 +1347,7 @@ app.get("/health", async (req, res) => {
     token_expires_at: meliTokens.expires_at ? new Date(meliTokens.expires_at).toISOString() : null,
     token_expired: tokenExpired(),
     api_verified: verification.ok,
+    automatic_refresh_available: Boolean(meliTokens.refresh_token),
     api_status: verification.status,
     api_user_id: verification.user_id || null,
     api_error: verification.error || ""
@@ -1241,6 +1367,7 @@ app.get("/meli/status", async (req, res) => {
     token_expires_at: meliTokens.expires_at ? new Date(meliTokens.expires_at).toISOString() : null,
     token_expired: tokenExpired(),
     api_verified: verification.ok,
+    automatic_refresh_available: Boolean(meliTokens.refresh_token),
     api_status: verification.status,
     api_user_id: verification.user_id || null,
     api_error: verification.error || "",
@@ -1480,7 +1607,7 @@ app.post("/monitor", requireN8n, async (req, res) => {
     job.not_found += summary.product_not_found;
     job.no_offers += summary.offers_not_found;
     job.api_errors += summary.api_errors;
-    job.errors += summary.invalid_ean + summary.api_errors + summary.other_errors;
+    job.errors += summary.product_not_found + summary.offers_not_found + summary.invalid_ean + summary.api_errors + summary.other_errors;
 
     logger.info({
       job_id: job.job_id,
@@ -1539,12 +1666,15 @@ app.post("/n8n/callback", requireN8n, (req, res) => {
     });
   }
 
-  job.status = body.status;
-  job.updated_rows = body.updated_rows;
+  const requestedStatus = body.status;
+  job.status = requestedStatus === "completed" && job.processed > 0 && job.ok === 0 ? "failed" : requestedStatus;
+  job.updated_rows = job.ok === 0 ? 0 : Math.min(body.updated_rows, job.ok);
   job.finished_at = nowIso();
 
   if (body.error) {
     job.error = body.error;
+  } else if (job.status === "failed" && job.ok === 0) {
+    job.error = "El monitoreo finalizó sin productos resueltos correctamente";
   }
 
   logger.info({
@@ -1748,7 +1878,11 @@ app.listen(config.port, async () => {
     concurrencia: config.meliConcurrency,
     intervalo_minimo_ms: config.meliMinTimeMs,
     preflight_obligatorio: config.requireApiPreflight,
-    busqueda_alternativa_por_nombre: config.enableNameFallback
+    busqueda_alternativa_por_nombre: config.enableNameFallback,
+    maximo_detalles_por_producto: config.maxItemDetails,
+    detalle_publico_habilitado: config.usePublicItemDetail,
+    anticipacion_renovacion_ms: config.tokenRefreshLeadMs,
+    intervalo_revision_token_ms: config.tokenCheckIntervalMs
   }, "Microservicio iniciado en modo exclusivo API de MercadoLibre");
 
   const verification = await verifyMeliApiConnection(true);
@@ -1760,4 +1894,10 @@ app.listen(config.port, async () => {
       oauth_start_url: `${config.appBaseUrl}/auth/mercadolibre/start`
     }, "El microservicio inició, pero la API de MercadoLibre todavía no está lista");
   }
+
+  setInterval(() => {
+    checkAndRefreshMeliToken().catch(error => {
+      logger.error({ error: error.message }, "Falló la revisión programada del token de MercadoLibre");
+    });
+  }, config.tokenCheckIntervalMs).unref();
 });

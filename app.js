@@ -52,7 +52,10 @@ const config = {
   cacheSuccessfulResults: String(process.env.CACHE_SUCCESSFUL_RESULTS || "true") === "true",
   logCatalogSamples: String(process.env.LOG_CATALOG_SAMPLES || "true") === "true",
   tokenRefreshLeadMs: Number(process.env.MELI_TOKEN_REFRESH_LEAD_MS || 1000 * 60 * 60),
-  tokenCheckIntervalMs: Number(process.env.MELI_TOKEN_CHECK_INTERVAL_MS || 1000 * 60 * 10)
+  tokenCheckIntervalMs: Number(process.env.MELI_TOKEN_CHECK_INTERVAL_MS || 1000 * 60 * 10),
+  enableSoldDiagnostics: String(process.env.ENABLE_SOLD_DIAGNOSTICS || "true") === "true",
+  soldDiagnosticMaxProducts: Math.max(1, Number(process.env.SOLD_DIAGNOSTIC_MAX_PRODUCTS || 10)),
+  soldDiagnosticSearchLimit: Math.max(1, Math.min(50, Number(process.env.SOLD_DIAGNOSTIC_SEARCH_LIMIT || 50)))
 };
 
 const jobs = new Map();
@@ -76,6 +79,7 @@ let apiVerificationCache = {
 };
 let apiDiagnosticCount = 0;
 let lastTokenRefreshWarningAt = 0;
+let soldDiagnosticCount = 0;
 
 const meliLimiter = new Bottleneck({
   maxConcurrent: config.meliConcurrency,
@@ -1280,6 +1284,156 @@ async function fetchCatalogSearchOffers(catalogProductId) {
   return { offers, endpoint: path, errors, pages_read: pagesRead };
 }
 
+
+function collectPotentialSalesFields(value, options = {}) {
+  const maxDepth = Number(options.maxDepth || 7);
+  const maxMatches = Number(options.maxMatches || 80);
+  const matches = [];
+  const visited = new WeakSet();
+  const keyPattern = /(sold|sale|sales|vend|quantity|units|orders|transactions|metric|summary)/i;
+
+  function visit(current, path, depth) {
+    if (matches.length >= maxMatches || depth > maxDepth || current === null || current === undefined) return;
+
+    if (typeof current !== "object") return;
+    if (visited.has(current)) return;
+    visited.add(current);
+
+    if (Array.isArray(current)) {
+      const limit = Math.min(current.length, 10);
+      for (let index = 0; index < limit; index += 1) {
+        visit(current[index], `${path}[${index}]`, depth + 1);
+      }
+      return;
+    }
+
+    for (const [key, child] of Object.entries(current)) {
+      if (matches.length >= maxMatches) break;
+      const childPath = path ? `${path}.${key}` : key;
+
+      if (keyPattern.test(key)) {
+        let safeValue = child;
+        if (child && typeof child === "object") {
+          safeValue = Array.isArray(child)
+            ? `[array:${child.length}]`
+            : `{object:${Object.keys(child).slice(0, 15).join(",")}}`;
+        } else if (typeof child === "string") {
+          safeValue = child.slice(0, 300);
+        }
+        matches.push({ path: childPath, key, value: safeValue });
+      }
+
+      visit(child, childPath, depth + 1);
+    }
+  }
+
+  visit(value, "", 0);
+  return matches;
+}
+
+function summarizeSearchResultForSold(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    id: normalizeItemId(firstString(raw.id, raw.item_id)) || null,
+    catalog_product_id: normalizeCatalogId(raw.catalog_product_id) || null,
+    price: firstNumber(raw.price),
+    sold_quantity: normalizeSold(firstPath(raw, ["sold_quantity", "soldQuantity", "sold"])),
+    available_quantity: firstNumber(raw.available_quantity, raw.availableQuantity),
+    status: normalizeStatus(raw.status) || null,
+    keys: Object.keys(raw).slice(0, 40)
+  };
+}
+
+async function diagnoseCatalogSold(catalogProductId, selectedItemId) {
+  if (!config.enableSoldDiagnostics) return null;
+  if (soldDiagnosticCount >= config.soldDiagnosticMaxProducts) return null;
+  soldDiagnosticCount += 1;
+
+  const diagnostic = {
+    catalog_product_id: catalogProductId,
+    selected_item_id: selectedItemId || null,
+    diagnostic_number: soldDiagnosticCount,
+    diagnostic_limit: config.soldDiagnosticMaxProducts,
+    catalog_product: null,
+    catalog_search: null
+  };
+
+  const productPath = `/products/${catalogProductId}`;
+
+  try {
+    const productData = await meliRequest(productPath, {
+      operation: "diagnosticar_vendidos_producto_catalogo",
+      maxRetries: 1
+    });
+
+    diagnostic.catalog_product = {
+      endpoint: productPath,
+      http_status: 200,
+      top_level_keys: productData && typeof productData === "object" ? Object.keys(productData).slice(0, 80) : [],
+      possible_sales_fields: collectPotentialSalesFields(productData),
+      buy_box_winner_keys: productData?.buy_box_winner && typeof productData.buy_box_winner === "object"
+        ? Object.keys(productData.buy_box_winner).slice(0, 50)
+        : [],
+      buy_box_winner_sales_fields: collectPotentialSalesFields(productData?.buy_box_winner || {})
+    };
+  } catch (error) {
+    diagnostic.catalog_product = {
+      endpoint: productPath,
+      http_status: error.status || null,
+      code: error.code || "api_error",
+      message: String(error.message || "").slice(0, 300)
+    };
+  }
+
+  const searchPath = `/sites/${config.meliSiteId}/search`;
+
+  try {
+    const searchData = await meliRequest(searchPath, {
+      params: {
+        catalog_product_id: catalogProductId,
+        limit: config.soldDiagnosticSearchLimit,
+        offset: 0
+      },
+      operation: "diagnosticar_vendidos_busqueda_catalogo",
+      maxRetries: 1,
+      auth: false
+    });
+
+    const rawResults = extractResults(searchData);
+    const samples = rawResults.slice(0, 10).map(summarizeSearchResultForSold).filter(Boolean);
+    const selectedRaw = rawResults.find(raw => normalizeItemId(firstString(raw?.id, raw?.item_id)) === selectedItemId) || null;
+    const selectedSummary = summarizeSearchResultForSold(selectedRaw);
+    const soldValues = rawResults
+      .map(raw => normalizeSold(firstPath(raw, ["sold_quantity", "soldQuantity", "sold"])))
+      .filter(value => value !== null);
+    const uniqueSoldValues = [...new Set(soldValues)];
+
+    diagnostic.catalog_search = {
+      endpoint: searchPath,
+      http_status: 200,
+      results_count: rawResults.length,
+      paging: searchData?.paging || null,
+      top_level_keys: searchData && typeof searchData === "object" ? Object.keys(searchData).slice(0, 50) : [],
+      result_samples: samples,
+      selected_item: selectedSummary,
+      sold_values_found: soldValues.length,
+      unique_sold_values: uniqueSoldValues.slice(0, 30),
+      all_sold_values_equal: soldValues.length > 1 && uniqueSoldValues.length === 1,
+      possible_sales_fields: collectPotentialSalesFields(searchData, { maxMatches: 120 })
+    };
+  } catch (error) {
+    diagnostic.catalog_search = {
+      endpoint: searchPath,
+      http_status: error.status || null,
+      code: error.code || "api_error",
+      message: String(error.message || "").slice(0, 300)
+    };
+  }
+
+  logger.info(diagnostic, "Diagnóstico para identificar la métrica Sold del producto de catálogo");
+  return diagnostic;
+}
+
 function mergeOffers(...lists) {
   const byItemId = new Map();
 
@@ -1363,7 +1517,7 @@ async function resolveProduct(row) {
     return resultError(row, ean, "invalid_ean", "EAN inválido");
   }
 
-  const cacheKey = `api-v3:${config.meliSiteId}:ean:${ean}`;
+  const cacheKey = `api-v4-sold-diagnostic:${config.meliSiteId}:ean:${ean}`;
   const cached = cacheGet(cacheKey);
 
   if (cached) {
@@ -1469,6 +1623,8 @@ async function resolveProduct(row) {
   }, "Finalizó la evaluación de publicaciones para calcular el menor precio");
 
   if (best) {
+    await diagnoseCatalogSold(catalogProductId, best.item_id);
+
     const result = buildResolvedResult(row, ean, {
       catalog_product_id: catalogProductId,
       item_id: best.item_id,
@@ -2174,6 +2330,9 @@ app.listen(config.port, async () => {
     maximo_paginas_catalogo: config.maxCatalogItemPages,
     cache_resultados_exitosos: config.cacheSuccessfulResults,
     logs_muestra_catalogo: config.logCatalogSamples,
+    diagnostico_sold_habilitado: config.enableSoldDiagnostics,
+    maximo_productos_diagnostico_sold: config.soldDiagnosticMaxProducts,
+    limite_busqueda_diagnostico_sold: config.soldDiagnosticSearchLimit,
     anticipacion_renovacion_ms: config.tokenRefreshLeadMs,
     intervalo_revision_token_ms: config.tokenCheckIntervalMs
   }, "Microservicio iniciado en modo exclusivo API de MercadoLibre");

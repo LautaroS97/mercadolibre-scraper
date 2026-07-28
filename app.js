@@ -37,6 +37,7 @@ const config = {
   meliClientSecret: process.env.MELI_CLIENT_SECRET || "",
   meliRedirectUri: process.env.MELI_REDIRECT_URI || "",
   meliSiteId: process.env.MELI_SITE_ID || "MLA",
+  meliAuthMode: String(process.env.MELI_AUTH_MODE || "standard").trim().toLowerCase(),
   allowedOrigins: (process.env.ALLOWED_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean),
   maxProductsPerRequest: Number(process.env.MAX_PRODUCTS_PER_JOB || 100),
   meliConcurrency: Number(process.env.MELI_CONCURRENCY || 2),
@@ -71,6 +72,7 @@ let apiVerificationCache = {
   checked_at: 0,
   ok: false,
   user_id: "",
+  global_selling_verified: false,
   status: "not_checked",
   error: ""
 };
@@ -264,6 +266,7 @@ function requireN8n(req, res, next) {
 }
 
 function getMeliAuthBase() {
+  if (config.meliAuthMode === "global_selling") return "https://global-selling.mercadolibre.com";
   if (config.meliSiteId === "MLB") return "https://auth.mercadolivre.com.br";
   return "https://auth.mercadolibre.com.ar";
 }
@@ -347,6 +350,7 @@ async function exchangeMeliToken(payload) {
     checked_at: 0,
     ok: false,
     user_id: meliTokens.user_id,
+    global_selling_verified: false,
     status: "token_updated",
     error: ""
   };
@@ -605,18 +609,41 @@ async function verifyMeliApiConnection(force = false) {
 
     const userId = user && user.id ? String(user.id) : meliTokens.user_id || "";
     meliTokens.user_id = userId;
+    let globalSellingVerified = false;
+
+    if (config.meliAuthMode === "global_selling") {
+      const globalUser = await meliRequest(`/marketplace/users/${userId}`, {
+        operation: "verificar_usuario_global_selling",
+        maxRetries: 0
+      });
+
+      globalSellingVerified = String(globalUser?.site_id || "").toUpperCase() === "CBT";
+
+      if (!globalSellingVerified) {
+        throw apiError("El usuario OAuth no fue reconocido como una cuenta Global Selling CBT", {
+          code: "global_selling_account_required",
+          status: 403,
+          endpoint: `/marketplace/users/${userId}`,
+          retryable: false,
+          requires_reauthorization: true
+        });
+      }
+    }
 
     apiVerificationCache = {
       checked_at: Date.now(),
       ok: true,
       user_id: userId,
+      global_selling_verified: globalSellingVerified,
       status: "connected",
       error: ""
     };
 
     logger.info({
       user_id: userId || null,
-      sitio: config.meliSiteId
+      sitio: config.meliSiteId,
+      auth_mode: config.meliAuthMode,
+      global_selling_verified: globalSellingVerified
     }, "La conexión con la API de MercadoLibre fue validada correctamente");
 
     return apiVerificationCache;
@@ -625,6 +652,7 @@ async function verifyMeliApiConnection(force = false) {
       checked_at: Date.now(),
       ok: false,
       user_id: meliTokens.user_id || "",
+      global_selling_verified: false,
       status: error.code || "connection_failed",
       error: error.message
     };
@@ -1291,6 +1319,7 @@ async function fetchSelectedItemSold(catalogProductId, selectedItemId) {
   const parseResponse = (data, authenticated) => {
     const sold = normalizeSold(firstPath(data, ["sold_quantity", "soldQuantity", "sold"]));
     const startTime = firstString(data?.start_time, data?.startTime) || null;
+    const globalSelling = authenticated && config.meliAuthMode === "global_selling";
 
     logger.info({
       catalog_product_id: catalogProductId,
@@ -1298,6 +1327,8 @@ async function fetchSelectedItemSold(catalogProductId, selectedItemId) {
       endpoint: path,
       requested_attributes: params.attributes,
       authenticated,
+      auth_mode: config.meliAuthMode,
+      global_selling: globalSelling,
       http_status: 200,
       sold_quantity: sold,
       start_time: startTime,
@@ -1307,12 +1338,17 @@ async function fetchSelectedItemSold(catalogProductId, selectedItemId) {
     return {
       sold,
       sold_source: sold !== null
-        ? authenticated ? "item_minimal_attributes_authenticated" : "item_minimal_attributes_public"
+        ? globalSelling
+          ? "item_minimal_attributes_global_selling"
+          : authenticated
+            ? "item_minimal_attributes_authenticated"
+            : "item_minimal_attributes_public"
         : "not_available",
       start_time: startTime,
       endpoint: path,
       http_status: 200,
-      authenticated
+      authenticated,
+      global_selling: globalSelling
     };
   };
 
@@ -1326,7 +1362,18 @@ async function fetchSelectedItemSold(catalogProductId, selectedItemId) {
       auth: false
     });
 
-    return parseResponse(data, false);
+    const publicResult = parseResponse(data, false);
+
+    if (publicResult.sold !== null) {
+      return publicResult;
+    }
+
+    logger.info({
+      catalog_product_id: catalogProductId,
+      selected_item_id: selectedItemId,
+      endpoint: path,
+      auth_mode: config.meliAuthMode
+    }, "La consulta pública respondió sin sold_quantity y se probará con OAuth");
   } catch (error) {
     publicError = error;
 
@@ -1342,7 +1389,7 @@ async function fetchSelectedItemSold(catalogProductId, selectedItemId) {
     }, "La consulta pública mínima de sold_quantity no pudo completarse");
   }
 
-  const shouldTryAuthenticated = [401, 403].includes(Number(publicError?.status || 0)) || [
+  const shouldTryAuthenticated = !publicError || [401, 403].includes(Number(publicError?.status || 0)) || [
     "api_unauthorized",
     "api_forbidden",
     "api_not_authenticated",
@@ -1366,6 +1413,8 @@ async function fetchSelectedItemSold(catalogProductId, selectedItemId) {
         endpoint: path,
         requested_attributes: params.attributes,
         authenticated: true,
+        auth_mode: config.meliAuthMode,
+        global_selling: config.meliAuthMode === "global_selling",
         http_status: error.status || null,
         code: error.code || "api_error",
         retryable: Boolean(error.retryable)
@@ -1377,7 +1426,8 @@ async function fetchSelectedItemSold(catalogProductId, selectedItemId) {
         start_time: null,
         endpoint: path,
         http_status: error.status || null,
-        authenticated: true
+        authenticated: true,
+        global_selling: config.meliAuthMode === "global_selling"
       };
     }
   }
@@ -1388,7 +1438,8 @@ async function fetchSelectedItemSold(catalogProductId, selectedItemId) {
     start_time: null,
     endpoint: path,
     http_status: publicError?.status || null,
-    authenticated: false
+    authenticated: false,
+    global_selling: false
   };
 }
 
@@ -1755,12 +1806,14 @@ app.get("/health", async (req, res) => {
     mode: "mercadolibre_api_only",
     time: nowIso(),
     site_id: config.meliSiteId,
+    auth_mode: config.meliAuthMode,
     credentials_configured: hasMeliCredentials(),
     access_token_present: hasMeliToken(),
     refresh_token_present: Boolean(meliTokens.refresh_token),
     token_expires_at: meliTokens.expires_at ? new Date(meliTokens.expires_at).toISOString() : null,
     token_expired: tokenExpired(),
     api_verified: verification.ok,
+    global_selling_verified: Boolean(verification.global_selling_verified),
     automatic_refresh_available: Boolean(meliTokens.refresh_token),
     api_status: verification.status,
     api_user_id: verification.user_id || null,
@@ -1775,12 +1828,14 @@ app.get("/meli/status", async (req, res) => {
     ok: verification.ok,
     ready: verification.ok,
     mode: "mercadolibre_api_only",
+    auth_mode: config.meliAuthMode,
     credentials_configured: hasMeliCredentials(),
     access_token_present: hasMeliToken(),
     refresh_token_present: Boolean(meliTokens.refresh_token),
     token_expires_at: meliTokens.expires_at ? new Date(meliTokens.expires_at).toISOString() : null,
     token_expired: tokenExpired(),
     api_verified: verification.ok,
+    global_selling_verified: Boolean(verification.global_selling_verified),
     automatic_refresh_available: Boolean(meliTokens.refresh_token),
     api_status: verification.status,
     api_user_id: verification.user_id || null,
@@ -2210,6 +2265,7 @@ app.get("/debug/meli-token", (req, res) => {
   return res.json({
     ok: true,
     mode: "mercadolibre_api_only",
+    auth_mode: config.meliAuthMode,
     credentials_configured: hasMeliCredentials(),
     connected: hasMeliToken(),
     expires_at: meliTokens.expires_at || null,
@@ -2288,6 +2344,7 @@ app.listen(config.port, async () => {
   logger.info({
     port: config.port,
     site_id: config.meliSiteId,
+    auth_mode: config.meliAuthMode,
     modo: "mercadolibre_api_only",
     credenciales_configuradas: hasMeliCredentials(),
     access_token_presente: hasMeliToken(),

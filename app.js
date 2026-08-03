@@ -41,13 +41,12 @@ const config = {
   allowedOrigins: (process.env.ALLOWED_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean),
   maxProductsPerRequest: Number(process.env.MAX_PRODUCTS_PER_JOB || 100),
   meliConcurrency: Number(process.env.MELI_CONCURRENCY || 2),
+  productConcurrency: Math.max(1, Math.floor(Number(process.env.PRODUCT_CONCURRENCY) || 2)),
   meliMinTimeMs: Number(process.env.MELI_MIN_TIME_MS || 700),
   cacheTtlMs: Number(process.env.CACHE_TTL_MS || 1000 * 60 * 60 * 6),
   httpTimeoutMs: Number(process.env.HTTP_TIMEOUT_MS || 20000),
   maxApiDiagnosticLogs: Number(process.env.MAX_API_DIAGNOSTIC_LOGS || 20),
   requireApiPreflight: String(process.env.REQUIRE_API_PREFLIGHT || "true") === "true",
-  enableSiteEanFallback: String(process.env.ENABLE_SITE_EAN_FALLBACK || "false") === "true",
-  enableCatalogSearchFallback: String(process.env.ENABLE_CATALOG_SEARCH_FALLBACK || "false") === "true",
   catalogItemsPageSize: Math.max(1, Math.min(50, Number(process.env.MELI_CATALOG_ITEMS_PAGE_SIZE || 50))),
   maxCatalogItemPages: Math.max(1, Math.min(20, Number(process.env.MELI_MAX_CATALOG_ITEM_PAGES || 10))),
   cacheSuccessfulResults: String(process.env.CACHE_SUCCESSFUL_RESULTS || "true") === "true",
@@ -526,7 +525,7 @@ async function meliRequest(path, options = {}) {
         continue;
       }
 
-      if (response.status === 429 && attempt <= maxRetries + 1) {
+      if (response.status === 429 && attempt <= maxRetries) {
         const retryAfter = Number(response.headers["retry-after"] || 2);
         logger.warn({
           operacion: operation,
@@ -536,7 +535,7 @@ async function meliRequest(path, options = {}) {
           intento: attempt
         }, "La API de MercadoLibre aplicó un límite de solicitudes");
         await sleep(Math.max(1, retryAfter) * 1000);
-        if (attempt <= maxRetries + 1) continue;
+        continue;
       }
 
       if (response.status >= 400) {
@@ -1001,7 +1000,6 @@ function resultError(row, ean, status, error, details = {}) {
 }
 
 function buildResolvedResult(row, ean, data) {
-  const status = data.sold === null || data.sold === undefined ? "partial_ok" : "ok";
   return {
     row_number: row.row_number,
     ean,
@@ -1010,13 +1008,13 @@ function buildResolvedResult(row, ean, data) {
     min_price: data.min_price === undefined ? null : data.min_price,
     link: data.link || data.item_id || null,
     mla: data.item_id || null,
-    sold: data.sold === undefined ? null : data.sold,
-    sold_source: data.sold_source || "not_available",
-    sold_start_time: data.sold_start_time || null,
+    sold: null,
+    sold_source: "not_available",
+    sold_start_time: null,
     source: data.source || "mercadolibre_api",
-    status,
+    status: "ok",
     error: "",
-    warning: status === "partial_ok" ? "MercadoLibre no informó la cantidad vendida para la publicación de menor precio" : "",
+    warning: "",
     api_http_status: 200,
     api_endpoint: data.api_endpoint || null,
     retryable: false,
@@ -1090,54 +1088,6 @@ async function searchProductsByEan(ean) {
 
     if (["api_unauthorized", "api_not_authenticated", "api_reauthorization_required"].includes(error.code)) {
       throw error;
-    }
-  }
-
-  if (config.enableSiteEanFallback) {
-    const fallbackPath = `/sites/${config.meliSiteId}/search`;
-    try {
-      const data = await meliRequest(fallbackPath, {
-        params: {
-          q: ean,
-          limit: config.catalogItemsPageSize
-        },
-        operation: "buscar_publicaciones_publicas_por_ean",
-        maxRetries: 1,
-        auth: false
-      });
-
-      const rawResults = extractResults(data);
-      const results = rawResults
-        .map(raw => ({
-          catalog_product_id: normalizeCatalogId(raw.catalog_product_id),
-          title: firstString(raw.title, raw.name),
-          raw
-        }))
-        .filter(result => result.catalog_product_id);
-
-      logger.info({
-        ean,
-        endpoint: fallbackPath,
-        resultados_publicos: rawResults.length,
-        productos_catalogo_encontrados: results.length
-      }, "Finalizó la búsqueda pública alternativa por UPC/EAN");
-
-      if (results.length) {
-        return {
-          results,
-          endpoint: fallbackPath,
-          operation: "buscar_publicaciones_publicas_por_ean",
-          errors
-        };
-      }
-    } catch (error) {
-      errors.push(error);
-      logger.warn({
-        ean,
-        endpoint: fallbackPath,
-        codigo: error.code || "api_error",
-        estado_http: error.status || null
-      }, "Falló la búsqueda pública alternativa por UPC/EAN");
     }
   }
 
@@ -1240,238 +1190,6 @@ async function fetchCatalogOffers(catalogProductId) {
   };
 }
 
-async function fetchCatalogSearchOffers(catalogProductId) {
-  if (!config.enableCatalogSearchFallback) {
-    return { offers: [], endpoint: null, errors: [], pages_read: 0 };
-  }
-
-  const path = `/sites/${config.meliSiteId}/search`;
-  const offers = [];
-  const errors = [];
-  const seenItemIds = new Set();
-  let offset = 0;
-  let pagesRead = 0;
-
-  for (let page = 0; page < config.maxCatalogItemPages; page += 1) {
-    try {
-      const data = await meliRequest(path, {
-        params: {
-          catalog_product_id: catalogProductId,
-          limit: config.catalogItemsPageSize,
-          offset
-        },
-        operation: "buscar_publicaciones_publicas_por_producto_catalogo",
-        maxRetries: 1,
-        auth: false
-      });
-
-      const pageRaw = extractResults(data);
-      const pageOffers = pageRaw
-        .map(raw => normalizeCatalogOffer(raw, catalogProductId, "public_catalog_search_api"))
-        .filter(Boolean);
-
-      for (const offer of pageOffers) {
-        if (seenItemIds.has(offer.item_id)) continue;
-        seenItemIds.add(offer.item_id);
-        offers.push(offer);
-      }
-
-      const paging = extractPaging(data, offset, config.catalogItemsPageSize, pageRaw.length);
-      pagesRead += 1;
-
-      logger.info({
-        catalog_product_id: catalogProductId,
-        endpoint: path,
-        pagina: page + 1,
-        offset,
-        recibidos: pageRaw.length,
-        normalizados: pageOffers.length,
-        total_acumulado: offers.length,
-        paging
-      }, "Se obtuvo una página de la búsqueda pública por producto de catálogo");
-
-      if (pageRaw.length === 0 || !paging.has_more || paging.next_offset <= offset) break;
-      offset = paging.next_offset;
-    } catch (error) {
-      errors.push(error);
-      logger.warn({
-        catalog_product_id: catalogProductId,
-        endpoint: path,
-        pagina: page + 1,
-        offset,
-        codigo: error.code || "api_error",
-        estado_http: error.status || null
-      }, "Falló la búsqueda pública por producto de catálogo");
-      break;
-    }
-  }
-
-  return { offers, endpoint: path, errors, pages_read: pagesRead };
-}
-
-
-async function fetchSelectedItemSold(catalogProductId, selectedItemId) {
-  const path = `/items/${selectedItemId}`;
-  const params = {
-    attributes: "id,sold_quantity,start_time"
-  };
-
-  const parseResponse = (data, authenticated) => {
-    const sold = normalizeSold(firstPath(data, ["sold_quantity", "soldQuantity", "sold"]));
-    const startTime = firstString(data?.start_time, data?.startTime) || null;
-    const globalSelling = authenticated && config.meliAuthMode === "global_selling";
-
-    logger.info({
-      catalog_product_id: catalogProductId,
-      selected_item_id: selectedItemId,
-      endpoint: path,
-      requested_attributes: params.attributes,
-      authenticated,
-      auth_mode: config.meliAuthMode,
-      global_selling: globalSelling,
-      http_status: 200,
-      sold_quantity: sold,
-      start_time: startTime,
-      response_keys: data && typeof data === "object" ? Object.keys(data).slice(0, 20) : []
-    }, "Consulta mínima de sold_quantity para la publicación seleccionada");
-
-    return {
-      sold,
-      sold_source: sold !== null
-        ? globalSelling
-          ? "item_minimal_attributes_global_selling"
-          : authenticated
-            ? "item_minimal_attributes_authenticated"
-            : "item_minimal_attributes_public"
-        : "not_available",
-      start_time: startTime,
-      endpoint: path,
-      http_status: 200,
-      authenticated,
-      global_selling: globalSelling
-    };
-  };
-
-  let publicError = null;
-
-  try {
-    const data = await meliRequest(path, {
-      params,
-      operation: "obtener_sold_quantity_minimo_publico",
-      maxRetries: 1,
-      auth: false
-    });
-
-    const publicResult = parseResponse(data, false);
-
-    if (publicResult.sold !== null) {
-      return publicResult;
-    }
-
-    logger.info({
-      catalog_product_id: catalogProductId,
-      selected_item_id: selectedItemId,
-      endpoint: path,
-      auth_mode: config.meliAuthMode
-    }, "La consulta pública respondió sin sold_quantity y se probará con OAuth");
-  } catch (error) {
-    publicError = error;
-
-    logger.warn({
-      catalog_product_id: catalogProductId,
-      selected_item_id: selectedItemId,
-      endpoint: path,
-      requested_attributes: params.attributes,
-      authenticated: false,
-      http_status: error.status || null,
-      code: error.code || "api_error",
-      retryable: Boolean(error.retryable)
-    }, "La consulta pública mínima de sold_quantity no pudo completarse");
-  }
-
-  const shouldTryAuthenticated = !publicError || [401, 403].includes(Number(publicError?.status || 0)) || [
-    "api_unauthorized",
-    "api_forbidden",
-    "api_not_authenticated",
-    "api_reauthorization_required"
-  ].includes(publicError?.code);
-
-  if (shouldTryAuthenticated && hasMeliToken()) {
-    try {
-      const data = await meliRequest(path, {
-        params,
-        operation: "obtener_sold_quantity_minimo_autenticado",
-        maxRetries: 1,
-        auth: true
-      });
-
-      return parseResponse(data, true);
-    } catch (error) {
-      logger.warn({
-        catalog_product_id: catalogProductId,
-        selected_item_id: selectedItemId,
-        endpoint: path,
-        requested_attributes: params.attributes,
-        authenticated: true,
-        auth_mode: config.meliAuthMode,
-        global_selling: config.meliAuthMode === "global_selling",
-        http_status: error.status || null,
-        code: error.code || "api_error",
-        retryable: Boolean(error.retryable)
-      }, "La consulta autenticada mínima de sold_quantity no pudo completarse");
-
-      return {
-        sold: null,
-        sold_source: error.status === 403 ? "item_endpoint_forbidden" : "not_available",
-        start_time: null,
-        endpoint: path,
-        http_status: error.status || null,
-        authenticated: true,
-        global_selling: config.meliAuthMode === "global_selling"
-      };
-    }
-  }
-
-  return {
-    sold: null,
-    sold_source: publicError?.status === 403 ? "item_endpoint_forbidden" : "not_available",
-    start_time: null,
-    endpoint: path,
-    http_status: publicError?.status || null,
-    authenticated: false,
-    global_selling: false
-  };
-}
-
-function mergeOffers(...lists) {
-  const byItemId = new Map();
-
-  for (const list of lists) {
-    for (const offer of list || []) {
-      if (!offer || !offer.item_id) continue;
-      const existing = byItemId.get(offer.item_id);
-      if (!existing) {
-        byItemId.set(offer.item_id, offer);
-        continue;
-      }
-
-      byItemId.set(offer.item_id, {
-        ...existing,
-        price: existing.price !== null ? existing.price : offer.price,
-        currency_id: existing.currency_id || offer.currency_id,
-        status: existing.status || offer.status,
-        link: existing.link || offer.link,
-        sold: existing.sold !== null ? existing.sold : offer.sold,
-        sold_source: existing.sold !== null ? existing.sold_source : offer.sold_source,
-        source: `${existing.source}+${offer.source}`,
-        raw: existing.raw
-      });
-    }
-  }
-
-  return [...byItemId.values()];
-}
-
 function isOfferActive(offer) {
   if (!offer || !offer.item_id) return false;
   if (!offer.status) return true;
@@ -1526,7 +1244,7 @@ async function resolveProduct(row) {
     return resultError(row, ean, "invalid_ean", "EAN inválido");
   }
 
-  const cacheKey = `api-v4-sold-diagnostic:${config.meliSiteId}:ean:${ean}`;
+  const cacheKey = `api-v5-price-only:${config.meliSiteId}:ean:${ean}`;
   const cached = cacheGet(cacheKey);
 
   if (cached) {
@@ -1599,16 +1317,8 @@ async function resolveProduct(row) {
   }
 
   accumulatedErrors.push(...catalogResult.errors);
-  let fallbackResult = { offers: [], endpoint: null, errors: [], pages_read: 0 };
-  let offers = catalogResult.offers;
-  let offersEndpoint = catalogResult.endpoint;
-
-  if (!pickBestOffer(offers) && config.enableCatalogSearchFallback) {
-    fallbackResult = await fetchCatalogSearchOffers(catalogProductId);
-    accumulatedErrors.push(...fallbackResult.errors);
-    offers = mergeOffers(catalogResult.offers, fallbackResult.offers);
-    if (fallbackResult.offers.length) offersEndpoint = fallbackResult.endpoint;
-  }
+  const offers = catalogResult.offers;
+  const offersEndpoint = catalogResult.endpoint;
 
   const best = pickBestOffer(offers);
   const itemCandidates = offers.filter(offer => offer.item_id);
@@ -1619,7 +1329,6 @@ async function resolveProduct(row) {
     ean,
     catalog_product_id: catalogProductId,
     publicaciones_catalogo: catalogResult.offers.length,
-    publicaciones_fallback: fallbackResult.offers.length,
     publicaciones_unicas: offers.length,
     publicaciones_activas: offers.filter(isOfferActive).length,
     publicaciones_con_precio: offers.filter(offer => offer.price !== null && offer.price !== undefined && Number(offer.price) > 0).length,
@@ -1632,26 +1341,11 @@ async function resolveProduct(row) {
   }, "Finalizó la evaluación de publicaciones para calcular el menor precio");
 
   if (best) {
-    let soldResult = {
-      sold: best.sold,
-      sold_source: best.sold_source,
-      start_time: null,
-      endpoint: null,
-      http_status: null
-    };
-
-    if (best.sold === null || best.sold === undefined) {
-      soldResult = await fetchSelectedItemSold(catalogProductId, best.item_id);
-    }
-
     const result = buildResolvedResult(row, ean, {
       catalog_product_id: catalogProductId,
       item_id: best.item_id,
       min_price: best.price,
       link: best.item_id,
-      sold: soldResult.sold,
-      sold_source: soldResult.sold_source,
-      sold_start_time: soldResult.start_time,
       source: best.source,
       api_endpoint: offersEndpoint
     });
@@ -1662,9 +1356,6 @@ async function resolveProduct(row) {
       catalog_product_id: catalogProductId,
       item_id: result.item_id,
       meli_price: result.min_price,
-      sold: result.sold,
-      sold_source: result.sold_source,
-      sold_start_time: result.sold_start_time,
       status: result.status,
       source: result.source,
       api_endpoint: result.api_endpoint
@@ -1786,6 +1477,24 @@ function countBatchResults(results) {
   return summary;
 }
 
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+
+  async function runWorker() {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -1797,11 +1506,9 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/health", async (req, res) => {
-  const verification = await verifyMeliApiConnection(false);
-
-  res.status(verification.ok ? 200 : 503).json({
-    ok: verification.ok,
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
     service: "meli-monitor-service",
     mode: "mercadolibre_api_only",
     time: nowIso(),
@@ -1812,12 +1519,12 @@ app.get("/health", async (req, res) => {
     refresh_token_present: Boolean(meliTokens.refresh_token),
     token_expires_at: meliTokens.expires_at ? new Date(meliTokens.expires_at).toISOString() : null,
     token_expired: tokenExpired(),
-    api_verified: verification.ok,
-    global_selling_verified: Boolean(verification.global_selling_verified),
+    api_verified: apiVerificationCache.ok,
+    global_selling_verified: Boolean(apiVerificationCache.global_selling_verified),
     automatic_refresh_available: Boolean(meliTokens.refresh_token),
-    api_status: verification.status,
-    api_user_id: verification.user_id || null,
-    api_error: verification.error || ""
+    api_status: apiVerificationCache.status,
+    api_user_id: apiVerificationCache.user_id || null,
+    api_error: apiVerificationCache.error || ""
   });
 });
 
@@ -2051,23 +1758,20 @@ app.post("/monitor", requireN8n, async (req, res) => {
       api_user_id: verification.user_id || null
     }, "Comienza el procesamiento de una tanda mediante la API de MercadoLibre");
 
-    const results = [];
-
-    for (const row of body.products) {
+    const results = await mapWithConcurrency(body.products, config.productConcurrency, async row => {
       try {
-        const result = await resolveProduct(row);
-        results.push(result);
+        return await resolveProduct(row);
       } catch (error) {
         const ean = normalizeEan(row.ean);
-        results.push(resultError(row, ean, "unexpected_error", error.message));
         logger.error({
           job_id: job.job_id,
           row_number: row.row_number,
           ean,
           error: error.message
         }, "Falló inesperadamente el procesamiento de un producto");
+        return resultError(row, ean, "unexpected_error", error.message);
       }
-    }
+    });
 
     const summary = countBatchResults(results);
 
@@ -2350,10 +2054,9 @@ app.listen(config.port, async () => {
     access_token_presente: hasMeliToken(),
     refresh_token_presente: Boolean(meliTokens.refresh_token),
     concurrencia: config.meliConcurrency,
+    concurrencia_productos: config.productConcurrency,
     intervalo_minimo_ms: config.meliMinTimeMs,
     preflight_obligatorio: config.requireApiPreflight,
-    fallback_publico_por_ean: config.enableSiteEanFallback,
-    fallback_publico_por_catalogo: config.enableCatalogSearchFallback,
     tamano_pagina_catalogo: config.catalogItemsPageSize,
     maximo_paginas_catalogo: config.maxCatalogItemPages,
     cache_resultados_exitosos: config.cacheSuccessfulResults,

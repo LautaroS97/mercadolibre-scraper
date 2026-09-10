@@ -145,8 +145,20 @@ const testProductSchema = z.object({
   name: z.string().optional().default("")
 });
 
+const upcLookupProductSchema = z.object({
+  row_number: z.number().int().positive(),
+  mla: z.union([z.string(), z.number()])
+});
+
 const upcLookupSchema = z.object({
-  mlas: z.array(z.union([z.string(), z.number()])).min(1).max(100)
+  job_id: z.string().min(8).max(100).optional().default(""),
+  mlas: z.array(z.union([z.string(), z.number()])).max(100).optional().default([]),
+  products: z.array(upcLookupProductSchema).max(100).optional().default([]),
+  total_products: z.union([z.string(), z.number()]).optional(),
+  batch_index: z.union([z.string(), z.number()]).optional(),
+  total_batches: z.union([z.string(), z.number()]).optional()
+}).refine(data => data.mlas.length > 0 || data.products.length > 0, {
+  message: "Debe enviar mlas o products"
 });
 
 function nowIso() {
@@ -173,6 +185,7 @@ function safeJobId() {
 function publicJob(job) {
   return {
     job_id: job.job_id,
+    job_type: job.job_type,
     status: job.status,
     sheet_url: job.sheet_url,
     sheet_name: job.sheet_name,
@@ -194,6 +207,7 @@ function publicJob(job) {
 function createEmptyJob(data) {
   return {
     job_id: data.job_id,
+    job_type: data.job_type || "ean_to_mla",
     sheet_url: data.sheet_url || "",
     sheet_name: data.sheet_name || "",
     email: data.email || "",
@@ -265,6 +279,17 @@ function requireN8n(req, res, next) {
   if (!verifyHmac(req, config.n8nSharedSecret)) {
     return res.status(401).json({ ok: false, error: "invalid_n8n_signature" });
   }
+  return next();
+}
+
+function requireWpOrN8n(req, res, next) {
+  const wpValid = Boolean(config.wpSharedSecret) && verifySharedSecret(req, config.wpSharedSecret) && verifyHmac(req, config.wpSharedSecret);
+  const n8nValid = Boolean(config.n8nSharedSecret) && verifySharedSecret(req, config.n8nSharedSecret) && verifyHmac(req, config.n8nSharedSecret);
+
+  if (!wpValid && !n8nValid) {
+    return res.status(401).json({ ok: false, error: "unauthorized_client" });
+  }
+
   return next();
 }
 
@@ -1505,12 +1530,15 @@ async function resolveProduct(row) {
   });
 }
 
-async function resolveUpcsByMla(rawMla) {
+async function resolveUpcsByMla(entry) {
+  const rowNumber = entry && typeof entry === "object" ? entry.row_number || null : null;
+  const rawMla = entry && typeof entry === "object" ? entry.mla : entry;
   const input = String(rawMla || "").trim();
   const mla = normalizeMlaId(input);
 
   if (!mla) {
     return {
+      row_number: rowNumber,
       input,
       mla: null,
       title: "",
@@ -1534,6 +1562,7 @@ async function resolveUpcsByMla(rawMla) {
     });
   } catch (error) {
     return {
+      row_number: rowNumber,
       input,
       mla,
       title: "",
@@ -1571,6 +1600,7 @@ async function resolveUpcsByMla(rawMla) {
   const primaryIdentifier = upc || identifiers[0] || null;
 
   return {
+    row_number: rowNumber,
     input,
     mla,
     title: firstString(item?.title),
@@ -1596,6 +1626,7 @@ async function notifyN8nJobCreated(job) {
 
   const payload = {
     job_id: job.job_id,
+    job_type: job.job_type,
     sheet_url: job.sheet_url,
     sheet_name: job.sheet_name,
     email: job.email || "",
@@ -1680,7 +1711,10 @@ app.get("/", (req, res) => {
     mode: "mercadolibre_api_only",
     health: "/health",
     meli_status: "/meli/status",
-    oauth_start: "/auth/mercadolibre/start"
+    oauth_start: "/auth/mercadolibre/start",
+    ean_job_start: "/jobs",
+    upc_job_start: "/upc-jobs",
+    upc_lookup: "/lookup-upcs"
   });
 });
 
@@ -1765,7 +1799,7 @@ app.post("/meli/test-product", requireN8n, async (req, res) => {
   });
 });
 
-app.post("/lookup-upcs", requireWp, async (req, res) => {
+app.post("/lookup-upcs", requireWpOrN8n, async (req, res) => {
   try {
     const parsed = upcLookupSchema.safeParse(req.body);
 
@@ -1789,19 +1823,58 @@ app.post("/lookup-upcs", requireWp, async (req, res) => {
       });
     }
 
-    const uniqueInputs = [...new Set(parsed.data.mlas.map(value => String(value).trim()))];
-    const results = await mapWithConcurrency(uniqueInputs, config.productConcurrency, resolveUpcsByMla);
+    const body = parsed.data;
+    const inputs = body.products.length
+      ? body.products
+      : [...new Set(body.mlas.map(value => String(value).trim()))];
+    let job = body.job_id ? jobs.get(body.job_id) : null;
+
+    if (body.job_id && !job) {
+      job = createEmptyJob({
+        job_id: body.job_id,
+        job_type: "mla_to_upc",
+        status: "processing",
+        total: Number(body.total_products || inputs.length)
+      });
+      job.started_at = nowIso();
+      jobs.set(job.job_id, job);
+    }
+
+    if (job) {
+      job.job_type = "mla_to_upc";
+      job.status = "processing";
+      job.total = Number(body.total_products || job.total || inputs.length);
+      job.started_at = job.started_at || nowIso();
+      job.finished_at = null;
+      job.error = "";
+    }
+
+    const results = await mapWithConcurrency(inputs, config.productConcurrency, resolveUpcsByMla);
+    const apiErrors = results.filter(result => String(result.status || "").startsWith("api_")).length;
     const summary = {
-      requested: parsed.data.mlas.length,
+      requested: inputs.length,
       processed: results.length,
       found: results.filter(result => result.status === "ok").length,
       without_identifier: results.filter(result => result.status === "identifier_not_available").length,
       invalid: results.filter(result => result.status === "invalid_mla").length,
       not_found: results.filter(result => result.status === "item_not_found").length,
+      api_errors: apiErrors,
       errors: results.filter(result => !["ok", "identifier_not_available", "invalid_mla", "item_not_found"].includes(result.status)).length
     };
 
+    if (job) {
+      job.processed += summary.processed;
+      job.ok += summary.found;
+      job.not_found += summary.not_found;
+      job.no_offers += summary.without_identifier;
+      job.api_errors += summary.api_errors;
+      job.errors += summary.processed - summary.found;
+    }
+
     logger.info({
+      job_id: body.job_id || null,
+      indice_tanda: Number(body.batch_index || 0),
+      total_tandas: Number(body.total_batches || 0),
       solicitados: summary.requested,
       procesados: summary.processed,
       identificadores_encontrados: summary.found,
@@ -1813,6 +1886,7 @@ app.post("/lookup-upcs", requireWp, async (req, res) => {
 
     return res.json({
       ok: true,
+      job: job ? publicJob(job) : null,
       summary,
       results
     });
@@ -1873,6 +1947,7 @@ app.post("/jobs", requireWp, async (req, res) => {
 
     const job = createEmptyJob({
       job_id: safeJobId(),
+      job_type: "ean_to_mla",
       sheet_url: body.sheet_url,
       sheet_name: body.sheet_name || "",
       email: body.email || "",
@@ -1906,6 +1981,90 @@ app.post("/jobs", requireWp, async (req, res) => {
     });
   } catch (error) {
     logger.error({ error: error.message }, "Falló la creación del job");
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error"
+    });
+  }
+});
+
+app.post("/upc-jobs", requireWp, async (req, res) => {
+  try {
+    const parsed = jobSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_payload",
+        details: parsed.error.flatten()
+      });
+    }
+
+    const body = parsed.data;
+
+    if (!isGoogleSheetUrl(body.sheet_url)) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_sheet_url"
+      });
+    }
+
+    if (config.requireApiPreflight) {
+      const verification = await verifyMeliApiConnection(true);
+
+      if (!verification.ok) {
+        logger.error({
+          estado_api: verification.status,
+          error_api: verification.error
+        }, "El job MLA a UPC fue rechazado porque la API de MercadoLibre no está disponible");
+
+        return res.status(503).json({
+          ok: false,
+          error: "meli_api_not_ready",
+          api_status: verification.status,
+          api_error: verification.error,
+          oauth_start_url: `${config.appBaseUrl}/auth/mercadolibre/start`
+        });
+      }
+    }
+
+    const job = createEmptyJob({
+      job_id: safeJobId(),
+      job_type: "mla_to_upc",
+      sheet_url: body.sheet_url,
+      sheet_name: body.sheet_name || "",
+      email: body.email || "",
+      status: "pending"
+    });
+
+    jobs.set(job.job_id, job);
+
+    try {
+      await notifyN8nJobCreated(job);
+      job.status = "sent_to_n8n";
+    } catch (error) {
+      job.status = "n8n_error";
+      job.error = error.message;
+      logger.error({ job_id: job.job_id, error: error.message }, "No se pudo iniciar el workflow MLA a UPC de n8n");
+      return res.status(502).json({
+        ok: false,
+        error: "n8n_webhook_failed",
+        job: publicJob(job)
+      });
+    }
+
+    logger.info({
+      job_id: job.job_id,
+      job_type: job.job_type,
+      sheet_name: job.sheet_name
+    }, "El job MLA a UPC fue creado y enviado a n8n");
+
+    return res.json({
+      ok: true,
+      job: publicJob(job)
+    });
+  } catch (error) {
+    logger.error({ error: error.message }, "Falló la creación del job MLA a UPC");
     return res.status(500).json({
       ok: false,
       error: "internal_error"

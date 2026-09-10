@@ -1548,16 +1548,16 @@ async function resolveUpcsByMla(entry) {
       gtins: [],
       identifiers: [],
       status: "invalid_mla",
-      error: "MLA inválido",
+      error: "MLA Catalog inválido",
       checked_at: nowIso()
     };
   }
 
-  let item;
+  let catalogProduct;
 
   try {
-    item = await meliRequest(`/items/${mla}`, {
-      operation: "buscar_identificadores_por_mla",
+    catalogProduct = await meliRequest(`/products/${mla}`, {
+      operation: "buscar_identificadores_en_producto_catalogo",
       maxRetries: 1
     });
   } catch (error) {
@@ -1566,13 +1566,13 @@ async function resolveUpcsByMla(entry) {
       input,
       mla,
       title: "",
-      catalog_product_id: null,
+      catalog_product_id: mla,
       primary_identifier: null,
       upc: null,
       gtins: [],
       identifiers: [],
       status: error.status === 404 ? "item_not_found" : error.code || "api_error",
-      error: error.status === 404 ? "La publicación MLA no existe o no está disponible" : error.message,
+      error: error.status === 404 ? "El producto MLA Catalog no existe o no está disponible" : error.message,
       api_http_status: error.status || null,
       retryable: Boolean(error.retryable),
       requires_reauthorization: Boolean(error.requires_reauthorization),
@@ -1580,22 +1580,7 @@ async function resolveUpcsByMla(entry) {
     };
   }
 
-  const catalogProductId = normalizeCatalogId(item?.catalog_product_id) || null;
-  let identifiers = extractProductIdentifiers(item, "item_api");
-  let catalogWarning = "";
-
-  if (!identifiers.length && catalogProductId) {
-    try {
-      const catalogProduct = await meliRequest(`/products/${catalogProductId}`, {
-        operation: "buscar_identificadores_en_producto_catalogo",
-        maxRetries: 1
-      });
-      identifiers = extractProductIdentifiers(catalogProduct, "catalog_product_api");
-    } catch (error) {
-      catalogWarning = error.code || error.message || "catalog_lookup_failed";
-    }
-  }
-
+  const identifiers = extractProductIdentifiers(catalogProduct, "catalog_product_api");
   const upc = identifiers.find(identifier => identifier.type === "UPC") || null;
   const primaryIdentifier = upc || identifiers[0] || null;
 
@@ -1603,15 +1588,15 @@ async function resolveUpcsByMla(entry) {
     row_number: rowNumber,
     input,
     mla,
-    title: firstString(item?.title),
-    catalog_product_id: catalogProductId,
+    title: firstString(catalogProduct?.name, catalogProduct?.title),
+    catalog_product_id: mla,
     primary_identifier: primaryIdentifier ? primaryIdentifier.value : null,
     upc: upc ? upc.value : null,
     gtins: identifiers.map(identifier => identifier.value),
     identifiers,
     status: identifiers.length ? "ok" : "identifier_not_available",
-    error: identifiers.length ? "" : "MercadoLibre no expone un UPC, EAN o GTIN para esta publicación",
-    warning: catalogWarning,
+    error: identifiers.length ? "" : "MercadoLibre no expone un UPC, EAN o GTIN para este producto de catálogo",
+    warning: "",
     api_http_status: 200,
     retryable: false,
     requires_reauthorization: false,

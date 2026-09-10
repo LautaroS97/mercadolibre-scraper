@@ -145,6 +145,10 @@ const testProductSchema = z.object({
   name: z.string().optional().default("")
 });
 
+const upcLookupSchema = z.object({
+  mlas: z.array(z.union([z.string(), z.number()])).min(1).max(100)
+});
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -745,6 +749,96 @@ function normalizeItemId(value) {
   const text = String(value || "");
   const match = text.match(/MLA\d{5,}|MLB\d{5,}|MLM\d{5,}|MLC\d{5,}|MCO\d{5,}|MPE\d{5,}|MLU\d{5,}/i);
   return match ? match[0].toUpperCase() : "";
+}
+
+function normalizeMlaId(value) {
+  const text = String(value || "").trim().toUpperCase();
+  const match = text.match(/MLA[-\s]?(\d{5,})/);
+  if (match) return `MLA${match[1]}`;
+  if (/^\d{5,}$/.test(text)) return `MLA${text}`;
+  return "";
+}
+
+function classifyProductIdentifier(value) {
+  if (value.length === 8) return "GTIN-8";
+  if (value.length === 12) return "UPC";
+  if (value.length === 13) return "EAN";
+  if (value.length === 14) return "GTIN-14";
+  return "GTIN";
+}
+
+function extractProductIdentifiers(payload, source) {
+  const found = new Map();
+  const visited = new Set();
+  const acceptedIds = new Set(["GTIN", "UPC", "EAN", "EAN13", "EAN_13", "GTIN14", "GTIN_14"]);
+
+  function addValue(rawValue, attributeId) {
+    const value = normalizeEan(rawValue);
+    if (value.length < 8 || value.length > 14) return;
+    const key = `${attributeId}:${value}`;
+    if (!found.has(key)) {
+      found.set(key, {
+        type: classifyProductIdentifier(value),
+        attribute_id: attributeId,
+        value,
+        source
+      });
+    }
+  }
+
+  function visit(value, depth) {
+    if (!value || typeof value !== "object" || depth > 8 || visited.has(value)) return;
+    visited.add(value);
+
+    if (!Array.isArray(value)) {
+      for (const [key, child] of Object.entries(value)) {
+        const directId = String(key).toUpperCase();
+        if (acceptedIds.has(directId) && (typeof child === "string" || typeof child === "number")) {
+          addValue(child, directId);
+        }
+      }
+
+      const attributeId = firstString(value.id, value.attribute_id, value.attributeId).toUpperCase();
+      const attributeName = firstString(value.name, value.attribute_name, value.attributeName).toUpperCase();
+      const identifierId = acceptedIds.has(attributeId)
+        ? attributeId
+        : acceptedIds.has(attributeName)
+          ? attributeName
+          : "";
+
+      if (identifierId) {
+        addValue(value.value_name, identifierId);
+        addValue(value.value, identifierId);
+        if (Array.isArray(value.values)) {
+          for (const entry of value.values) {
+            if (entry && typeof entry === "object") {
+              addValue(entry.name, identifierId);
+              addValue(entry.value_name, identifierId);
+              addValue(entry.value, identifierId);
+            } else {
+              addValue(entry, identifierId);
+            }
+          }
+        }
+      }
+    }
+
+    for (const child of Object.values(value)) {
+      if (child && typeof child === "object") visit(child, depth + 1);
+    }
+  }
+
+  visit(payload, 0);
+
+  const byValue = new Map();
+  for (const identifier of found.values()) {
+    const existing = byValue.get(identifier.value);
+    if (!existing || identifier.attribute_id === "UPC") {
+      byValue.set(identifier.value, identifier);
+    }
+  }
+
+  return [...byValue.values()];
 }
 
 function getPath(object, path) {
@@ -1411,6 +1505,90 @@ async function resolveProduct(row) {
   });
 }
 
+async function resolveUpcsByMla(rawMla) {
+  const input = String(rawMla || "").trim();
+  const mla = normalizeMlaId(input);
+
+  if (!mla) {
+    return {
+      input,
+      mla: null,
+      title: "",
+      catalog_product_id: null,
+      primary_identifier: null,
+      upc: null,
+      gtins: [],
+      identifiers: [],
+      status: "invalid_mla",
+      error: "MLA inválido",
+      checked_at: nowIso()
+    };
+  }
+
+  let item;
+
+  try {
+    item = await meliRequest(`/items/${mla}`, {
+      operation: "buscar_identificadores_por_mla",
+      maxRetries: 1
+    });
+  } catch (error) {
+    return {
+      input,
+      mla,
+      title: "",
+      catalog_product_id: null,
+      primary_identifier: null,
+      upc: null,
+      gtins: [],
+      identifiers: [],
+      status: error.status === 404 ? "item_not_found" : error.code || "api_error",
+      error: error.status === 404 ? "La publicación MLA no existe o no está disponible" : error.message,
+      api_http_status: error.status || null,
+      retryable: Boolean(error.retryable),
+      requires_reauthorization: Boolean(error.requires_reauthorization),
+      checked_at: nowIso()
+    };
+  }
+
+  const catalogProductId = normalizeCatalogId(item?.catalog_product_id) || null;
+  let identifiers = extractProductIdentifiers(item, "item_api");
+  let catalogWarning = "";
+
+  if (!identifiers.length && catalogProductId) {
+    try {
+      const catalogProduct = await meliRequest(`/products/${catalogProductId}`, {
+        operation: "buscar_identificadores_en_producto_catalogo",
+        maxRetries: 1
+      });
+      identifiers = extractProductIdentifiers(catalogProduct, "catalog_product_api");
+    } catch (error) {
+      catalogWarning = error.code || error.message || "catalog_lookup_failed";
+    }
+  }
+
+  const upc = identifiers.find(identifier => identifier.type === "UPC") || null;
+  const primaryIdentifier = upc || identifiers[0] || null;
+
+  return {
+    input,
+    mla,
+    title: firstString(item?.title),
+    catalog_product_id: catalogProductId,
+    primary_identifier: primaryIdentifier ? primaryIdentifier.value : null,
+    upc: upc ? upc.value : null,
+    gtins: identifiers.map(identifier => identifier.value),
+    identifiers,
+    status: identifiers.length ? "ok" : "identifier_not_available",
+    error: identifiers.length ? "" : "MercadoLibre no expone un UPC, EAN o GTIN para esta publicación",
+    warning: catalogWarning,
+    api_http_status: 200,
+    retryable: false,
+    requires_reauthorization: false,
+    checked_at: nowIso()
+  };
+}
+
 async function notifyN8nJobCreated(job) {
   if (!config.n8nWebhookUrl) {
     throw new Error("missing_n8n_webhook_url");
@@ -1585,6 +1763,72 @@ app.post("/meli/test-product", requireN8n, async (req, res) => {
     ok: ["ok", "partial_ok"].includes(result.status),
     result
   });
+});
+
+app.post("/lookup-upcs", requireWp, async (req, res) => {
+  try {
+    const parsed = upcLookupSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_payload",
+        details: parsed.error.flatten()
+      });
+    }
+
+    const verification = await verifyMeliApiConnection(false);
+
+    if (!verification.ok) {
+      return res.status(503).json({
+        ok: false,
+        error: "meli_api_not_ready",
+        api_status: verification.status,
+        api_error: verification.error,
+        oauth_start_url: `${config.appBaseUrl}/auth/mercadolibre/start`
+      });
+    }
+
+    const uniqueInputs = [...new Set(parsed.data.mlas.map(value => String(value).trim()))];
+    const results = await mapWithConcurrency(uniqueInputs, config.productConcurrency, resolveUpcsByMla);
+    const summary = {
+      requested: parsed.data.mlas.length,
+      processed: results.length,
+      found: results.filter(result => result.status === "ok").length,
+      without_identifier: results.filter(result => result.status === "identifier_not_available").length,
+      invalid: results.filter(result => result.status === "invalid_mla").length,
+      not_found: results.filter(result => result.status === "item_not_found").length,
+      errors: results.filter(result => !["ok", "identifier_not_available", "invalid_mla", "item_not_found"].includes(result.status)).length
+    };
+
+    logger.info({
+      solicitados: summary.requested,
+      procesados: summary.processed,
+      identificadores_encontrados: summary.found,
+      sin_identificador: summary.without_identifier,
+      mla_invalidos: summary.invalid,
+      publicaciones_no_encontradas: summary.not_found,
+      errores: summary.errors
+    }, "Finalizó la consulta de UPC, EAN y GTIN por MLA");
+
+    return res.json({
+      ok: true,
+      summary,
+      results
+    });
+  } catch (error) {
+    logger.error({
+      codigo: error.code || "internal_error",
+      estado_http: error.status || null,
+      error: error.message
+    }, "Falló la consulta de identificadores por MLA");
+
+    return res.status(error.status && error.status >= 400 && error.status < 600 ? error.status : 500).json({
+      ok: false,
+      error: error.code || "internal_error",
+      message: error.message
+    });
+  }
 });
 
 app.post("/jobs", requireWp, async (req, res) => {

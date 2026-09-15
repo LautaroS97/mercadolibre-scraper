@@ -51,6 +51,12 @@ const config = {
   maxCatalogItemPages: Math.max(1, Math.min(20, Number(process.env.MELI_MAX_CATALOG_ITEM_PAGES || 20))),
   maxUpcAssociatedItems: Math.max(1, Math.min(1000, Number(process.env.MELI_MAX_UPC_ASSOCIATED_ITEMS || 1000))),
   upcItemBatchSize: Math.max(1, Math.min(20, Number(process.env.MELI_UPC_ITEM_BATCH_SIZE || 20))),
+  maxUpcCatalogProducts: Math.max(1, Math.min(100, Number(process.env.MELI_MAX_UPC_CATALOG_PRODUCTS || 30))),
+  maxUpcCatalogDepth: Math.max(0, Math.min(5, Number(process.env.MELI_MAX_UPC_CATALOG_DEPTH || 3))),
+  maxUpcRelatedItems: Math.max(1, Math.min(200, Number(process.env.MELI_MAX_UPC_RELATED_ITEMS || 50))),
+  maxUpcUserProducts: Math.max(1, Math.min(200, Number(process.env.MELI_MAX_UPC_USER_PRODUCTS || 50))),
+  maxUpcWebPages: Math.max(0, Math.min(100, Number(process.env.MELI_MAX_UPC_WEB_PAGES || 20))),
+  upcAttemptLogBodyChars: Math.max(0, Math.min(4000, Number(process.env.MELI_UPC_ATTEMPT_LOG_BODY_CHARS || 800))),
   cacheSuccessfulResults: String(process.env.CACHE_SUCCESSFUL_RESULTS || "true") === "true",
   logCatalogSamples: String(process.env.LOG_CATALOG_SAMPLES || "false") === "true",
   tokenRefreshLeadMs: Number(process.env.MELI_TOKEN_REFRESH_LEAD_MS || 1000 * 60 * 60),
@@ -88,7 +94,7 @@ const meliLimiter = new Bottleneck({
 const http = axios.create({
   timeout: config.httpTimeoutMs,
   headers: {
-    "User-Agent": "MeliMonitorService/3.0",
+    "User-Agent": "MeliMonitorService/4.0",
     "Accept-Language": "es-AR,es;q=0.9,en;q=0.8"
   },
   maxRedirects: 3,
@@ -1581,7 +1587,9 @@ function mergeIdentifierEvidence(store, identifiers, context = {}) {
         attribute_ids: new Set(),
         sources: new Set(),
         item_ids: new Set(),
+        catalog_product_ids: new Set(),
         catalog_direct: false,
+        catalog_tree_direct: false,
         verified: false,
         verification_status: "pending",
         reverse_catalog_product_ids: new Set()
@@ -1593,7 +1601,9 @@ function mergeIdentifierEvidence(store, identifiers, context = {}) {
     if (identifier.source) evidence.sources.add(String(identifier.source));
     if (context.source) evidence.sources.add(String(context.source));
     if (context.item_id) evidence.item_ids.add(String(context.item_id));
+    if (context.catalog_product_id) evidence.catalog_product_ids.add(String(context.catalog_product_id));
     if (context.catalog_direct) evidence.catalog_direct = true;
+    if (context.catalog_tree_direct) evidence.catalog_tree_direct = true;
   }
 }
 
@@ -1713,8 +1723,797 @@ function serializeIdentifierEvidence(evidence) {
     attribute_ids: [...evidence.attribute_ids],
     sources: [...evidence.sources],
     item_ids: [...evidence.item_ids],
+    catalog_product_ids: [...evidence.catalog_product_ids],
     reverse_catalog_product_ids: [...evidence.reverse_catalog_product_ids]
   };
+}
+
+function responseFingerprint(data) {
+  try {
+    return crypto.createHash("sha1").update(JSON.stringify(data)).digest("hex");
+  } catch (error) {
+    return "";
+  }
+}
+
+function safeAttemptPreview(data) {
+  if (!config.upcAttemptLogBodyChars) return "";
+  try {
+    return JSON.stringify(data).slice(0, config.upcAttemptLogBodyChars);
+  } catch (error) {
+    return String(data || "").slice(0, config.upcAttemptLogBodyChars);
+  }
+}
+
+function countPayloadArrays(payload) {
+  const visited = new Set();
+  let attributes = 0;
+  let variations = 0;
+  let pictures = 0;
+
+  function visit(value, depth) {
+    if (!value || typeof value !== "object" || visited.has(value) || depth > 8) return;
+    visited.add(value);
+    if (Array.isArray(value.attributes)) attributes += value.attributes.length;
+    if (Array.isArray(value.variations)) variations += value.variations.length;
+    if (Array.isArray(value.pictures)) pictures += value.pictures.length;
+    for (const child of Object.values(value)) {
+      if (child && typeof child === "object") visit(child, depth + 1);
+    }
+  }
+
+  visit(payload, 0);
+  return { attributes, variations, pictures };
+}
+
+function summarizeAttemptParams(params) {
+  const summary = {};
+  if (!params || typeof params !== "object") return summary;
+  if (params.ids) summary.ids_count = String(params.ids).split(",").filter(Boolean).length;
+  if (params.attributes) summary.attributes = String(params.attributes);
+  if (params.include_internal_attributes !== undefined) {
+    summary.include_internal_attributes = Boolean(params.include_internal_attributes);
+  }
+  if (params.limit !== undefined) summary.limit = params.limit;
+  if (params.offset !== undefined) summary.offset = params.offset;
+  if (params.catalog_product_id) summary.catalog_product_id = params.catalog_product_id;
+  if (params.product_identifier) summary.product_identifier = params.product_identifier;
+  if (params.site_id) summary.site_id = params.site_id;
+  return summary;
+}
+
+function recordIdentifierAttempt(attempts, record) {
+  attempts.push(record);
+  logger.info({
+    catalog_product_id: record.catalog_product_id || null,
+    item_id: record.item_id || null,
+    user_product_id: record.user_product_id || null,
+    family_id: record.family_id || null,
+    attempt_id: record.attempt_id,
+    source: record.source,
+    endpoint: record.endpoint,
+    authentication: record.authentication,
+    parameters: record.parameters,
+    http_status: record.http_status,
+    inner_status: record.inner_status || null,
+    duration_ms: record.duration_ms,
+    response_keys: record.response_keys || [],
+    attributes_count: record.attributes_count || 0,
+    variations_count: record.variations_count || 0,
+    pictures_count: record.pictures_count || 0,
+    identifiers_found: record.identifiers_found || [],
+    response_fingerprint: record.response_fingerprint || "",
+    response_duplicate_of: record.response_duplicate_of || null,
+    api_error: record.api_error || null,
+    response_preview: record.response_preview || "",
+    continued: record.continued !== false
+  }, "Finalizó un camino del rastreo exhaustivo de identificadores");
+}
+
+async function executeMeliIdentifierAttempt(spec, attempts, fingerprints) {
+  const startedAt = Date.now();
+  const authentication = spec.auth === false ? "public" : "bearer";
+
+  try {
+    const data = await meliRequest(spec.endpoint, {
+      params: spec.params || {},
+      auth: spec.auth !== false,
+      operation: `rastrear_identificador_${spec.attemptId}`,
+      maxRetries: spec.maxRetries === undefined ? 1 : spec.maxRetries
+    });
+    const identifiers = extractProductIdentifiers(data, spec.source);
+    const fingerprint = responseFingerprint(data);
+    const duplicateOf = fingerprint && fingerprints.has(fingerprint) ? fingerprints.get(fingerprint) : null;
+    if (fingerprint && !duplicateOf) fingerprints.set(fingerprint, spec.attemptId);
+    const counts = countPayloadArrays(data);
+    const record = {
+      attempt_id: spec.attemptId,
+      source: spec.source,
+      endpoint: spec.endpoint,
+      authentication,
+      parameters: summarizeAttemptParams(spec.params),
+      catalog_product_id: spec.catalogProductId || null,
+      item_id: spec.itemId || null,
+      user_product_id: spec.userProductId || null,
+      family_id: spec.familyId || null,
+      http_status: 200,
+      duration_ms: Date.now() - startedAt,
+      response_keys: data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data).slice(0, 40) : [],
+      attributes_count: counts.attributes,
+      variations_count: counts.variations,
+      pictures_count: counts.pictures,
+      identifiers_found: identifiers.map(identifier => identifier.value),
+      response_fingerprint: fingerprint,
+      response_duplicate_of: duplicateOf,
+      continued: true
+    };
+    recordIdentifierAttempt(attempts, record);
+    return { ok: true, data, identifiers, status: 200, record };
+  } catch (error) {
+    const record = {
+      attempt_id: spec.attemptId,
+      source: spec.source,
+      endpoint: spec.endpoint,
+      authentication,
+      parameters: summarizeAttemptParams(spec.params),
+      catalog_product_id: spec.catalogProductId || null,
+      item_id: spec.itemId || null,
+      user_product_id: spec.userProductId || null,
+      family_id: spec.familyId || null,
+      http_status: error.status || 0,
+      duration_ms: Date.now() - startedAt,
+      identifiers_found: [],
+      api_error: error.code || "api_error",
+      response_preview: safeAttemptPreview(error.data || error.message),
+      continued: true
+    };
+    recordIdentifierAttempt(attempts, record);
+    return { ok: false, data: null, identifiers: [], status: error.status || 0, error, record };
+  }
+}
+
+function normalizeUserProductId(value) {
+  const text = String(value || "").trim().toUpperCase();
+  const match = text.match(/(?:ML[A-Z]U|CBTU|U)\d{3,}/);
+  return match ? match[0] : "";
+}
+
+function extractReferenceValues(payload) {
+  const catalogProductIds = new Set();
+  const childCatalogProductIds = new Set();
+  const itemIds = new Set();
+  const parentItemIds = new Set();
+  const userProductIds = new Set();
+  const familyIds = new Set();
+  const permalinks = new Set();
+  const imageUrls = new Set();
+  const visited = new Set();
+
+  function addCatalog(value, child = false) {
+    const id = normalizeCatalogId(value);
+    if (!id) return;
+    catalogProductIds.add(id);
+    if (child) childCatalogProductIds.add(id);
+  }
+
+  function addItem(value, parent = false) {
+    const id = normalizeItemId(value);
+    if (!id) return;
+    itemIds.add(id);
+    if (parent) parentItemIds.add(id);
+  }
+
+  function visit(value, depth) {
+    if (!value || typeof value !== "object" || visited.has(value) || depth > 10) return;
+    visited.add(value);
+
+    if (!Array.isArray(value)) {
+      for (const [rawKey, child] of Object.entries(value)) {
+        const key = String(rawKey).toLowerCase();
+        if (["catalog_product_id", "catalogproductid", "product_id"].includes(key)) addCatalog(child);
+        if (["children_ids", "child_product_ids"].includes(key) && Array.isArray(child)) {
+          for (const entry of child) addCatalog(entry, true);
+        }
+        if (["item_id", "itemid"].includes(key)) addItem(child);
+        if (key === "parent_item_id") addItem(child, true);
+        if (["user_product_id", "userproductid"].includes(key)) {
+          const id = normalizeUserProductId(child);
+          if (id) userProductIds.add(id);
+        }
+        if (key === "family_id" && child !== null && child !== undefined && String(child).trim()) {
+          familyIds.add(String(child).trim());
+        }
+        if (typeof child === "string" && /^https?:\/\//i.test(child)) {
+          const looksLikeImage = /\.(?:jpe?g|png|webp|gif)(?:\?|$)/i.test(child) || /mlstatic\.com/i.test(child);
+          if (["secure_url", "secureurl", "image", "image_url", "thumbnail"].includes(key) || (key === "url" && looksLikeImage)) {
+            imageUrls.add(child);
+          } else if (["permalink", "canonical_url"].includes(key) || (key === "url" && !looksLikeImage)) {
+            permalinks.add(child);
+          }
+        }
+      }
+    }
+
+    for (const child of Object.values(value)) {
+      if (child && typeof child === "object") visit(child, depth + 1);
+    }
+  }
+
+  visit(payload, 0);
+  return {
+    catalogProductIds: [...catalogProductIds],
+    childCatalogProductIds: [...childCatalogProductIds],
+    itemIds: [...itemIds],
+    parentItemIds: [...parentItemIds],
+    userProductIds: [...userProductIds],
+    familyIds: [...familyIds],
+    permalinks: [...permalinks],
+    imageUrls: [...imageUrls]
+  };
+}
+
+function extractLabeledIdentifiersFromText(text, source) {
+  const identifiers = [];
+  const seen = new Set();
+  const patterns = [
+    /(?:gtin(?:[-_ ]?(?:8|12|13|14))?|ean(?:[-_ ]?(?:8|13))?|upc(?:[-_ ]?a)?|c[oó]digo\s+universal)[^0-9]{0,60}([0-9][0-9\s.-]{6,24}[0-9])/gi,
+    /"(?:gtin(?:8|12|13|14)?|ean|upc|productID|barcode)"\s*:\s*"?([0-9]{8,14})"?/gi
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(String(text || ""))) !== null) {
+      const value = normalizeEan(match[1]);
+      if (!isValidProductIdentifier(value) || seen.has(value)) continue;
+      seen.add(value);
+      identifiers.push({
+        type: classifyProductIdentifier(value),
+        attribute_id: "LABELED_TEXT",
+        value,
+        source
+      });
+    }
+  }
+
+  return identifiers;
+}
+
+function collectJsonLdIdentifiers(html, source) {
+  const identifiers = [];
+  const pattern = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let match;
+
+  while ((match = pattern.exec(String(html || ""))) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      identifiers.push(...extractProductIdentifiers(parsed, source));
+    } catch (error) {
+      identifiers.push(...extractLabeledIdentifiersFromText(match[1], source));
+    }
+  }
+
+  identifiers.push(...extractLabeledIdentifiersFromText(html, source));
+  return identifiers;
+}
+
+async function executeWebIdentifierAttempt(spec, attempts, fingerprints) {
+  const startedAt = Date.now();
+
+  try {
+    const response = await http.get(spec.url, {
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (compatible; MeliIdentifierResolver/4.0)"
+      }
+    });
+    const html = typeof response.data === "string" ? response.data : JSON.stringify(response.data || {});
+    const identifiers = response.status >= 200 && response.status < 300
+      ? collectJsonLdIdentifiers(html, spec.source)
+      : [];
+    const fingerprint = responseFingerprint(html);
+    const duplicateOf = fingerprint && fingerprints.has(fingerprint) ? fingerprints.get(fingerprint) : null;
+    if (fingerprint && !duplicateOf) fingerprints.set(fingerprint, spec.attemptId);
+    const record = {
+      attempt_id: spec.attemptId,
+      source: spec.source,
+      endpoint: spec.url,
+      authentication: "public_web",
+      parameters: {},
+      catalog_product_id: spec.catalogProductId || null,
+      item_id: spec.itemId || null,
+      http_status: response.status,
+      duration_ms: Date.now() - startedAt,
+      response_keys: [],
+      attributes_count: 0,
+      variations_count: 0,
+      pictures_count: 0,
+      identifiers_found: identifiers.map(identifier => identifier.value),
+      response_fingerprint: fingerprint,
+      response_duplicate_of: duplicateOf,
+      response_preview: response.status >= 400 ? html.slice(0, config.upcAttemptLogBodyChars) : "",
+      continued: true
+    };
+    recordIdentifierAttempt(attempts, record);
+    return { ok: response.status >= 200 && response.status < 300, identifiers, status: response.status, html, record };
+  } catch (error) {
+    const record = {
+      attempt_id: spec.attemptId,
+      source: spec.source,
+      endpoint: spec.url,
+      authentication: "public_web",
+      parameters: {},
+      catalog_product_id: spec.catalogProductId || null,
+      item_id: spec.itemId || null,
+      http_status: error.response?.status || 0,
+      duration_ms: Date.now() - startedAt,
+      identifiers_found: [],
+      api_error: "web_request_error",
+      response_preview: safeAttemptPreview(error.response?.data || error.message),
+      continued: true
+    };
+    recordIdentifierAttempt(attempts, record);
+    return { ok: false, identifiers: [], status: record.http_status, error, record };
+  }
+}
+
+function addPayloadToMap(payloadMap, id, data, source, attemptId) {
+  if (!id || !data || typeof data !== "object") return;
+  if (!payloadMap.has(id)) payloadMap.set(id, []);
+  const fingerprint = responseFingerprint(data);
+  const entries = payloadMap.get(id);
+  if (fingerprint && entries.some(entry => entry.fingerprint === fingerprint)) return;
+  entries.push({ data, source, attempt_id: attemptId, fingerprint });
+}
+
+function getCatalogWebUrl(catalogProductId) {
+  const siteDomains = {
+    MLA: "www.mercadolibre.com.ar",
+    MLB: "www.mercadolivre.com.br",
+    MLM: "www.mercadolibre.com.mx",
+    MLC: "www.mercadolibre.cl",
+    MCO: "www.mercadolibre.com.co",
+    MPE: "www.mercadolibre.com.pe",
+    MLU: "www.mercadolibre.com.uy"
+  };
+  const host = siteDomains[config.meliSiteId] || siteDomains.MLA;
+  return `https://${host}/p/${catalogProductId}`;
+}
+
+function buildAttemptSummary(attempts) {
+  const summary = {
+    total: attempts.length,
+    succeeded: 0,
+    forbidden: 0,
+    not_found: 0,
+    rate_limited: 0,
+    failed: 0,
+    public: 0,
+    bearer: 0,
+    public_web: 0,
+    with_identifiers: 0
+  };
+
+  for (const attempt of attempts) {
+    if (attempt.authentication === "public") summary.public += 1;
+    if (attempt.authentication === "bearer") summary.bearer += 1;
+    if (attempt.authentication === "public_web") summary.public_web += 1;
+    if (attempt.http_status >= 200 && attempt.http_status < 300) summary.succeeded += 1;
+    else if (attempt.http_status === 403 || attempt.inner_status === 403) summary.forbidden += 1;
+    else if (attempt.http_status === 404 || attempt.inner_status === 404) summary.not_found += 1;
+    else if (attempt.http_status === 429 || attempt.inner_status === 429) summary.rate_limited += 1;
+    else summary.failed += 1;
+    if (Array.isArray(attempt.identifiers_found) && attempt.identifiers_found.length) summary.with_identifiers += 1;
+  }
+
+  return summary;
+}
+
+async function scanCatalogProductMatrix(rootCatalogProductId, evidenceStore, attempts, fingerprints, verificationRootCatalogProductId = rootCatalogProductId) {
+  const queue = [{ id: rootCatalogProductId, depth: 0 }];
+  const visitedCatalogProductIds = new Set();
+  const itemIds = new Set();
+  const rawOffers = [];
+  const permalinks = new Set();
+  const userProductIds = new Set();
+  let rootProduct = null;
+  let complete = true;
+
+  while (queue.length && visitedCatalogProductIds.size < config.maxUpcCatalogProducts) {
+    const current = queue.shift();
+    if (!current || visitedCatalogProductIds.has(current.id) || current.depth > config.maxUpcCatalogDepth) continue;
+    visitedCatalogProductIds.add(current.id);
+    let currentProductSucceeded = false;
+    let currentOffersSucceeded = false;
+
+    for (const auth of [true, false]) {
+      const mode = auth ? "auth" : "public";
+      const productAttempt = await executeMeliIdentifierAttempt({
+        attemptId: `catalog_${current.id}_${mode}`,
+        endpoint: `/products/${current.id}`,
+        auth,
+        source: `catalog_product_api_${mode}`,
+        catalogProductId: current.id
+      }, attempts, fingerprints);
+
+      if (productAttempt.ok) {
+        currentProductSucceeded = true;
+        if (current.id === rootCatalogProductId && !rootProduct) rootProduct = productAttempt.data;
+        mergeIdentifierEvidence(evidenceStore, productAttempt.identifiers, {
+          source: `catalog_product_api_${mode}`,
+          catalog_product_id: current.id,
+          catalog_direct: current.id === verificationRootCatalogProductId,
+          catalog_tree_direct: current.id !== verificationRootCatalogProductId
+        });
+        const refs = extractReferenceValues(productAttempt.data);
+        for (const url of refs.permalinks) permalinks.add(url);
+        for (const upId of refs.userProductIds) userProductIds.add(upId);
+        if (current.depth < config.maxUpcCatalogDepth) {
+          for (const childId of [...refs.childCatalogProductIds, ...refs.catalogProductIds]) {
+            if (childId !== current.id && !visitedCatalogProductIds.has(childId)) {
+              queue.push({ id: childId, depth: current.depth + 1 });
+            }
+          }
+        }
+      }
+
+      let offset = 0;
+      let offerRouteComplete = true;
+      for (let page = 0; page < config.maxCatalogItemPages; page += 1) {
+        const offerAttempt = await executeMeliIdentifierAttempt({
+          attemptId: `catalog_items_${current.id}_${mode}_${page + 1}`,
+          endpoint: `/products/${current.id}/items`,
+          params: { limit: config.catalogItemsPageSize, offset },
+          auth,
+          source: `catalog_items_api_${mode}`,
+          catalogProductId: current.id
+        }, attempts, fingerprints);
+
+        if (!offerAttempt.ok) {
+          offerRouteComplete = false;
+          break;
+        }
+
+        const pageRaw = extractResults(offerAttempt.data);
+        const paging = extractPaging(offerAttempt.data, offset, config.catalogItemsPageSize, pageRaw.length);
+        for (const raw of pageRaw) {
+          rawOffers.push(raw);
+          const offer = normalizeCatalogOffer(raw, current.id, `catalog_items_api_${mode}`);
+          if (offer?.item_id) itemIds.add(offer.item_id);
+          if (offer?.link) permalinks.add(offer.link);
+          const identifiers = extractProductIdentifiers(raw, `catalog_items_api_${mode}`);
+          mergeIdentifierEvidence(evidenceStore, identifiers, {
+            source: `catalog_items_api_${mode}`,
+            item_id: offer?.item_id || null,
+            catalog_product_id: current.id
+          });
+          const refs = extractReferenceValues(raw);
+          for (const itemId of refs.itemIds) itemIds.add(itemId);
+          for (const url of refs.permalinks) permalinks.add(url);
+          for (const upId of refs.userProductIds) userProductIds.add(upId);
+          if (current.depth < config.maxUpcCatalogDepth) {
+            for (const catalogId of refs.catalogProductIds) {
+              if (catalogId !== current.id && !visitedCatalogProductIds.has(catalogId)) {
+                queue.push({ id: catalogId, depth: current.depth + 1 });
+              }
+            }
+          }
+        }
+
+        if (!pageRaw.length || !paging.has_more || paging.next_offset <= offset) break;
+        offset = paging.next_offset;
+        if (page === config.maxCatalogItemPages - 1) offerRouteComplete = false;
+      }
+      if (offerRouteComplete) currentOffersSucceeded = true;
+
+      let searchOffset = 0;
+      for (let page = 0; page < config.maxCatalogItemPages; page += 1) {
+        const searchAttempt = await executeMeliIdentifierAttempt({
+          attemptId: `site_search_catalog_${current.id}_${mode}_${page + 1}`,
+          endpoint: `/sites/${config.meliSiteId}/search`,
+          params: { catalog_product_id: current.id, limit: 50, offset: searchOffset },
+          auth,
+          source: `site_search_catalog_${mode}`,
+          catalogProductId: current.id
+        }, attempts, fingerprints);
+
+        if (!searchAttempt.ok) break;
+        const searchResults = extractResults(searchAttempt.data);
+        for (const raw of searchResults) {
+          const offer = normalizeCatalogOffer(raw, current.id, `site_search_catalog_${mode}`);
+          if (offer?.item_id) itemIds.add(offer.item_id);
+          if (offer?.link) permalinks.add(offer.link);
+          mergeIdentifierEvidence(evidenceStore, extractProductIdentifiers(raw, `site_search_catalog_${mode}`), {
+            source: `site_search_catalog_${mode}`,
+            item_id: offer?.item_id || null,
+            catalog_product_id: current.id
+          });
+          const refs = extractReferenceValues(raw);
+          for (const itemId of refs.itemIds) itemIds.add(itemId);
+          for (const url of refs.permalinks) permalinks.add(url);
+          for (const upId of refs.userProductIds) userProductIds.add(upId);
+          if (current.depth < config.maxUpcCatalogDepth) {
+            for (const catalogId of refs.catalogProductIds) {
+              if (catalogId !== current.id && !visitedCatalogProductIds.has(catalogId)) {
+                queue.push({ id: catalogId, depth: current.depth + 1 });
+              }
+            }
+          }
+        }
+        const paging = extractPaging(searchAttempt.data, searchOffset, 50, searchResults.length);
+        if (!searchResults.length || !paging.has_more || paging.next_offset <= searchOffset) break;
+        searchOffset = paging.next_offset;
+      }
+    }
+
+    if (!currentProductSucceeded || !currentOffersSucceeded) complete = false;
+  }
+
+  if (queue.length) complete = false;
+
+  return {
+    rootProduct,
+    catalogProductIds: [...visitedCatalogProductIds],
+    itemIds: [...itemIds],
+    rawOffers,
+    permalinks: [...permalinks],
+    userProductIds: [...userProductIds],
+    complete
+  };
+}
+
+async function scanItemMatrix(itemIds, evidenceStore, attempts, fingerprints, payloadMap) {
+  const uniqueItemIds = [...new Set(itemIds.map(normalizeItemId).filter(Boolean))];
+  const limitedItemIds = uniqueItemIds.slice(0, config.maxUpcAssociatedItems);
+  const accessibleItemIds = new Set();
+  const forbiddenItemIds = new Set();
+  const fields = "id,title,catalog_product_id,parent_item_id,user_product_id,family_id,category_id,permalink,attributes,variations,pictures";
+  const profiles = [
+    { id: "fields_auth", auth: true, params: { attributes: fields } },
+    { id: "plain_auth", auth: true, params: {} },
+    { id: "internal_auth", auth: true, params: { include_internal_attributes: true } },
+    { id: "fields_public", auth: false, params: { attributes: fields } },
+    { id: "plain_public", auth: false, params: {} },
+    { id: "internal_public", auth: false, params: { include_internal_attributes: true } }
+  ];
+
+  for (let index = 0; index < limitedItemIds.length; index += config.upcItemBatchSize) {
+    const batch = limitedItemIds.slice(index, index + config.upcItemBatchSize);
+
+    for (const profile of profiles) {
+      const attempt = await executeMeliIdentifierAttempt({
+        attemptId: `items_bulk_${profile.id}_${Math.floor(index / config.upcItemBatchSize) + 1}`,
+        endpoint: "/items",
+        params: { ids: batch.join(","), ...profile.params },
+        auth: profile.auth,
+        source: `items_bulk_${profile.id}`
+      }, attempts, fingerprints);
+
+      if (!attempt.ok) {
+        if (attempt.status === 403) for (const itemId of batch) forbiddenItemIds.add(itemId);
+        continue;
+      }
+
+      const responses = Array.isArray(attempt.data) ? attempt.data : [attempt.data];
+      for (const response of responses) {
+        const innerStatus = Number(response?.code || response?.status || 200);
+        const body = response?.body && typeof response.body === "object" ? response.body : response;
+        const bodyItemId = normalizeItemId(firstString(body?.id, body?.item_id));
+        const matchedItemId = bodyItemId || (batch.length === 1 ? batch[0] : "");
+        const identifiers = innerStatus >= 200 && innerStatus < 300
+          ? extractProductIdentifiers(body, `items_bulk_${profile.id}`)
+          : [];
+        recordIdentifierAttempt(attempts, {
+          attempt_id: `${attempt.record.attempt_id}_${matchedItemId || "unknown"}_inner`,
+          source: `items_bulk_${profile.id}`,
+          endpoint: "/items",
+          authentication: profile.auth ? "bearer" : "public",
+          parameters: summarizeAttemptParams({ ids: batch.join(","), ...profile.params }),
+          item_id: matchedItemId || null,
+          http_status: attempt.status,
+          inner_status: innerStatus,
+          duration_ms: 0,
+          response_keys: body && typeof body === "object" ? Object.keys(body).slice(0, 40) : [],
+          identifiers_found: identifiers.map(identifier => identifier.value),
+          response_preview: innerStatus >= 400 ? safeAttemptPreview(body) : "",
+          continued: true
+        });
+        if (!matchedItemId) continue;
+        if (innerStatus >= 200 && innerStatus < 300 && body && typeof body === "object") {
+          accessibleItemIds.add(matchedItemId);
+          addPayloadToMap(payloadMap, matchedItemId, body, `items_bulk_${profile.id}`, attempt.record.attempt_id);
+          mergeIdentifierEvidence(evidenceStore, identifiers, {
+            source: `items_bulk_${profile.id}`,
+            item_id: matchedItemId
+          });
+        } else if (innerStatus === 403) {
+          forbiddenItemIds.add(matchedItemId);
+        }
+      }
+    }
+  }
+
+  for (const itemId of limitedItemIds) {
+    for (const profile of profiles) {
+      const attempt = await executeMeliIdentifierAttempt({
+        attemptId: `item_${itemId}_${profile.id}`,
+        endpoint: `/items/${itemId}`,
+        params: profile.params,
+        auth: profile.auth,
+        source: `item_api_${profile.id}`,
+        itemId
+      }, attempts, fingerprints);
+
+      if (attempt.ok) {
+        accessibleItemIds.add(itemId);
+        addPayloadToMap(payloadMap, itemId, attempt.data, `item_api_${profile.id}`, attempt.record.attempt_id);
+        mergeIdentifierEvidence(evidenceStore, attempt.identifiers, {
+          source: `item_api_${profile.id}`,
+          item_id: itemId
+        });
+      } else if (attempt.status === 403) {
+        forbiddenItemIds.add(itemId);
+      }
+    }
+  }
+
+  return {
+    requestedItemIds: limitedItemIds,
+    accessibleItemIds: [...accessibleItemIds],
+    forbiddenItemIds: [...forbiddenItemIds],
+    truncated: limitedItemIds.length < uniqueItemIds.length
+  };
+}
+
+async function scanDescriptions(itemIds, evidenceStore, attempts, fingerprints) {
+  for (const itemId of itemIds) {
+    for (const auth of [true, false]) {
+      const mode = auth ? "auth" : "public";
+      const attempt = await executeMeliIdentifierAttempt({
+        attemptId: `description_${itemId}_${mode}`,
+        endpoint: `/items/${itemId}/description`,
+        auth,
+        source: `item_description_${mode}`,
+        itemId
+      }, attempts, fingerprints);
+      if (!attempt.ok) continue;
+      const text = firstString(
+        attempt.data?.plain_text,
+        attempt.data?.text,
+        attempt.data?.description,
+        JSON.stringify(attempt.data || {})
+      );
+      const identifiers = extractLabeledIdentifiersFromText(text, `item_description_${mode}`);
+      mergeIdentifierEvidence(evidenceStore, identifiers, {
+        source: `item_description_${mode}`,
+        item_id: itemId
+      });
+    }
+  }
+}
+
+async function scanUserProducts(userProductIds, evidenceStore, attempts, fingerprints) {
+  const queue = [...new Set(userProductIds.map(normalizeUserProductId).filter(Boolean))];
+  const visitedUserProductIds = new Set();
+  const accessibleUserProductIds = new Set();
+  const visitedFamilyModes = new Set();
+  const familyIds = new Set();
+  const catalogProductIds = new Set();
+
+  while (queue.length && visitedUserProductIds.size < config.maxUpcUserProducts) {
+    const userProductId = queue.shift();
+    if (!userProductId || visitedUserProductIds.has(userProductId)) continue;
+    visitedUserProductIds.add(userProductId);
+
+    for (const auth of [true, false]) {
+      const mode = auth ? "auth" : "public";
+      const attempt = await executeMeliIdentifierAttempt({
+        attemptId: `user_product_${userProductId}_${mode}`,
+        endpoint: `/user-products/${userProductId}`,
+        auth,
+        source: `user_product_api_${mode}`,
+        userProductId
+      }, attempts, fingerprints);
+      if (!attempt.ok) continue;
+      accessibleUserProductIds.add(userProductId);
+      mergeIdentifierEvidence(evidenceStore, attempt.identifiers, { source: `user_product_api_${mode}` });
+      const refs = extractReferenceValues(attempt.data);
+      for (const catalogId of refs.catalogProductIds) catalogProductIds.add(catalogId);
+      for (const linkedUserProductId of refs.userProductIds) {
+        if (!visitedUserProductIds.has(linkedUserProductId)) queue.push(linkedUserProductId);
+      }
+
+      for (const familyId of refs.familyIds) {
+        familyIds.add(familyId);
+        const familyKey = `${familyId}:${mode}`;
+        if (visitedFamilyModes.has(familyKey)) continue;
+        visitedFamilyModes.add(familyKey);
+        const familyAttempt = await executeMeliIdentifierAttempt({
+          attemptId: `user_product_family_${familyId}_${mode}`,
+          endpoint: `/sites/${config.meliSiteId}/user-products-families/${familyId}`,
+          auth,
+          source: `user_product_family_api_${mode}`,
+          familyId
+        }, attempts, fingerprints);
+        if (!familyAttempt.ok) continue;
+        mergeIdentifierEvidence(evidenceStore, familyAttempt.identifiers, { source: `user_product_family_api_${mode}` });
+        const familyRefs = extractReferenceValues(familyAttempt.data);
+        for (const familyUserProductId of familyRefs.userProductIds) {
+          if (!visitedUserProductIds.has(familyUserProductId)) queue.push(familyUserProductId);
+        }
+        const listedIds = Array.isArray(familyAttempt.data?.user_products_ids)
+          ? familyAttempt.data.user_products_ids
+          : [];
+        for (const listedId of listedIds) {
+          const normalized = normalizeUserProductId(listedId);
+          if (normalized && !visitedUserProductIds.has(normalized)) queue.push(normalized);
+        }
+      }
+    }
+  }
+
+  return {
+    userProductIds: [...visitedUserProductIds],
+    accessibleUserProductIds: [...accessibleUserProductIds],
+    familyIds: [...familyIds],
+    catalogProductIds: [...catalogProductIds],
+    truncated: queue.length > 0
+  };
+}
+
+async function verifyIdentifierEvidenceExhaustive(catalogProductId, validCatalogProductIds, evidenceList, attempts, fingerprints) {
+  const validCatalogIds = new Set([catalogProductId, ...validCatalogProductIds]);
+  return mapWithConcurrency(evidenceList, config.productConcurrency, async evidence => {
+    if (evidence.catalog_direct) {
+      evidence.verified = true;
+      evidence.verification_status = "catalog_direct";
+      evidence.reverse_catalog_product_ids.add(catalogProductId);
+      return evidence;
+    }
+
+    if (evidence.catalog_tree_direct) {
+      evidence.verified = true;
+      evidence.verification_status = "catalog_tree_direct";
+      for (const linkedCatalogId of evidence.catalog_product_ids) {
+        evidence.reverse_catalog_product_ids.add(linkedCatalogId);
+      }
+      return evidence;
+    }
+
+    let anySuccess = false;
+    for (const auth of [true, false]) {
+      const mode = auth ? "auth" : "public";
+      const attempt = await executeMeliIdentifierAttempt({
+        attemptId: `reverse_${evidence.value}_${mode}`,
+        endpoint: "/products/search",
+        params: {
+          site_id: config.meliSiteId,
+          product_identifier: evidence.value,
+          status: "active"
+        },
+        auth,
+        source: `reverse_product_search_${mode}`,
+        catalogProductId
+      }, attempts, fingerprints);
+      if (!attempt.ok) continue;
+      anySuccess = true;
+      for (const result of extractResults(attempt.data).map(normalizeCatalogProduct).filter(Boolean)) {
+        evidence.reverse_catalog_product_ids.add(result.catalog_product_id);
+      }
+    }
+
+    const reverseIds = [...evidence.reverse_catalog_product_ids];
+    if (reverseIds.some(reverseId => validCatalogIds.has(reverseId))) {
+      evidence.verified = true;
+      evidence.verification_status = reverseIds.includes(catalogProductId) ? "reverse_match" : "reverse_catalog_tree_match";
+    } else if (reverseIds.length) {
+      evidence.verification_status = "reverse_other_catalog";
+    } else if (anySuccess) {
+      evidence.verification_status = "reverse_no_match";
+    } else {
+      evidence.verification_status = "reverse_api_error";
+    }
+    return evidence;
+  });
 }
 
 async function resolveUpcsByMla(entry) {
@@ -1743,14 +2542,23 @@ async function resolveUpcsByMla(entry) {
     };
   }
 
-  let catalogProduct;
+  const evidenceStore = new Map();
+  const attempts = [];
+  const fingerprints = new Map();
+  const payloadMap = new Map();
+  const allItemIds = new Set();
+  const allPermalinks = new Set();
+  const allImageUrls = new Set();
+  const allUserProductIds = new Set();
 
-  try {
-    catalogProduct = await meliRequest(`/products/${mla}`, {
-      operation: "buscar_identificadores_en_producto_catalogo",
-      maxRetries: 1
-    });
-  } catch (error) {
+  const catalogScan = await scanCatalogProductMatrix(mla, evidenceStore, attempts, fingerprints);
+  const catalogProduct = catalogScan.rootProduct;
+  const allCatalogProductIds = new Set(catalogScan.catalogProductIds);
+  let catalogScansComplete = catalogScan.complete;
+
+  if (!catalogProduct) {
+    const rootAttempts = attempts.filter(attempt => attempt.catalog_product_id === mla && attempt.source.startsWith("catalog_product_api"));
+    const rootNotFound = rootAttempts.length > 0 && rootAttempts.every(attempt => attempt.http_status === 404);
     return {
       row_number: rowNumber,
       input,
@@ -1764,45 +2572,143 @@ async function resolveUpcsByMla(entry) {
       candidate_upcs: [],
       candidate_gtins: [],
       identifiers: [],
-      status: error.status === 404 ? "item_not_found" : error.code || "api_error",
-      error: error.status === 404 ? "El producto MLA Catalog no existe o no está disponible" : error.message,
-      api_http_status: error.status || null,
-      retryable: Boolean(error.retryable),
-      requires_reauthorization: Boolean(error.requires_reauthorization),
+      status: rootNotFound ? "item_not_found" : "partial_scan",
+      error: rootNotFound ? "El producto MLA Catalog no existe o no está disponible" : "No fue posible consultar el producto de catálogo por ninguna ruta",
+      attempt_summary: buildAttemptSummary(attempts),
+      attempts: attempts.slice(0, 200),
+      attempts_truncated: attempts.length > 200,
+      api_http_status: rootNotFound ? 404 : 503,
+      retryable: !rootNotFound,
+      requires_reauthorization: false,
       checked_at: nowIso()
     };
   }
 
-  const evidenceStore = new Map();
-  const directIdentifiers = extractProductIdentifiers(catalogProduct, "catalog_product_api");
-  mergeIdentifierEvidence(evidenceStore, directIdentifiers, {
-    source: "catalog_product_api",
-    catalog_direct: true
-  });
+  for (const itemId of catalogScan.itemIds) allItemIds.add(itemId);
+  for (const url of catalogScan.permalinks) allPermalinks.add(url);
+  for (const userProductId of catalogScan.userProductIds) allUserProductIds.add(userProductId);
 
-  const catalogOffers = await fetchCatalogOffers(mla);
-  const associatedItemIds = catalogOffers.offers.map(offer => offer.item_id).filter(Boolean);
+  let itemScan = await scanItemMatrix([...allItemIds], evidenceStore, attempts, fingerprints, payloadMap);
+  const visitedItemIds = new Set(itemScan.requestedItemIds);
+  const accessibleItemIds = new Set(itemScan.accessibleItemIds);
+  const forbiddenItemIds = new Set(itemScan.forbiddenItemIds);
+  let relatedItemsTruncated = itemScan.truncated;
 
-  for (const rawOffer of catalogOffers.raw_offers) {
-    const normalizedOffer = normalizeCatalogOffer(rawOffer, mla, "catalog_items_api");
-    const identifiers = extractProductIdentifiers(rawOffer, "catalog_items_api");
-    mergeIdentifierEvidence(evidenceStore, identifiers, {
-      source: "catalog_items_api",
-      item_id: normalizedOffer?.item_id || null
-    });
+  for (let relationDepth = 0; relationDepth < 2; relationDepth += 1) {
+    const relatedItemIds = new Set();
+    for (const [itemId, payloads] of payloadMap.entries()) {
+      for (const payload of payloads) {
+        const refs = extractReferenceValues(payload.data);
+        for (const parentItemId of refs.parentItemIds) {
+          if (!visitedItemIds.has(parentItemId)) relatedItemIds.add(parentItemId);
+        }
+        for (const linkedItemId of refs.itemIds) {
+          if (linkedItemId !== itemId && !visitedItemIds.has(linkedItemId)) relatedItemIds.add(linkedItemId);
+        }
+        for (const userProductId of refs.userProductIds) allUserProductIds.add(userProductId);
+        for (const url of refs.permalinks) allPermalinks.add(url);
+        for (const url of refs.imageUrls) allImageUrls.add(url);
+      }
+    }
+
+    const nextRelatedItems = [...relatedItemIds].slice(0, config.maxUpcRelatedItems);
+    if (!nextRelatedItems.length) break;
+    if (nextRelatedItems.length < relatedItemIds.size) relatedItemsTruncated = true;
+    for (const itemId of nextRelatedItems) {
+      visitedItemIds.add(itemId);
+      allItemIds.add(itemId);
+    }
+    const relatedScan = await scanItemMatrix(nextRelatedItems, evidenceStore, attempts, fingerprints, payloadMap);
+    for (const itemId of relatedScan.accessibleItemIds) accessibleItemIds.add(itemId);
+    for (const itemId of relatedScan.forbiddenItemIds) forbiddenItemIds.add(itemId);
+    if (relatedScan.truncated) relatedItemsTruncated = true;
   }
 
-  const itemDetails = await fetchAssociatedItemDetails(associatedItemIds);
-
-  for (const item of itemDetails.details) {
-    const identifiers = extractProductIdentifiers(item.data, "item_api");
-    mergeIdentifierEvidence(evidenceStore, identifiers, {
-      source: "item_api",
-      item_id: item.item_id
-    });
+  const referencedCatalogProductIds = new Set();
+  for (const payloads of payloadMap.values()) {
+    for (const payload of payloads) {
+      const refs = extractReferenceValues(payload.data);
+      for (const catalogId of [...refs.catalogProductIds, ...refs.childCatalogProductIds]) {
+        if (!allCatalogProductIds.has(catalogId)) referencedCatalogProductIds.add(catalogId);
+      }
+    }
   }
 
-  const evidence = await verifyIdentifierEvidence(mla, [...evidenceStore.values()]);
+  const remainingCatalogCapacity = Math.max(0, config.maxUpcCatalogProducts - allCatalogProductIds.size);
+  const additionalCatalogProductIds = [...referencedCatalogProductIds].slice(0, remainingCatalogCapacity);
+  if (additionalCatalogProductIds.length < referencedCatalogProductIds.size) catalogScansComplete = false;
+
+  for (const catalogId of additionalCatalogProductIds) {
+    const additionalCatalogScan = await scanCatalogProductMatrix(
+      catalogId,
+      evidenceStore,
+      attempts,
+      fingerprints,
+      mla
+    );
+    if (!additionalCatalogScan.complete) catalogScansComplete = false;
+    for (const scannedCatalogId of additionalCatalogScan.catalogProductIds) allCatalogProductIds.add(scannedCatalogId);
+    for (const url of additionalCatalogScan.permalinks) allPermalinks.add(url);
+    for (const userProductId of additionalCatalogScan.userProductIds) allUserProductIds.add(userProductId);
+    const newItemIds = additionalCatalogScan.itemIds.filter(itemId => !visitedItemIds.has(itemId));
+    for (const itemId of newItemIds) {
+      visitedItemIds.add(itemId);
+      allItemIds.add(itemId);
+    }
+    if (newItemIds.length) {
+      const additionalItemScan = await scanItemMatrix(newItemIds, evidenceStore, attempts, fingerprints, payloadMap);
+      for (const itemId of additionalItemScan.accessibleItemIds) accessibleItemIds.add(itemId);
+      for (const itemId of additionalItemScan.forbiddenItemIds) forbiddenItemIds.add(itemId);
+      if (additionalItemScan.truncated) relatedItemsTruncated = true;
+    }
+  }
+
+  for (const [itemId, payloads] of payloadMap.entries()) {
+    for (const payload of payloads) {
+      const refs = extractReferenceValues(payload.data);
+      for (const userProductId of refs.userProductIds) allUserProductIds.add(userProductId);
+      for (const url of refs.permalinks) allPermalinks.add(url);
+      for (const url of refs.imageUrls) allImageUrls.add(url);
+      mergeIdentifierEvidence(evidenceStore, extractProductIdentifiers(payload.data, payload.source), {
+        source: payload.source,
+        item_id: itemId
+      });
+    }
+  }
+
+  const userProductScan = await scanUserProducts([...allUserProductIds], evidenceStore, attempts, fingerprints);
+  await scanDescriptions([...visitedItemIds], evidenceStore, attempts, fingerprints);
+
+  const webTargets = [{
+    url: getCatalogWebUrl(mla),
+    source: "catalog_public_web",
+    catalogProductId: mla,
+    itemId: null
+  }];
+  for (const url of allPermalinks) {
+    webTargets.push({ url, source: "item_public_web", catalogProductId: mla, itemId: null });
+  }
+  const uniqueWebTargets = [...new Map(webTargets.map(target => [target.url, target])).values()]
+    .slice(0, config.maxUpcWebPages);
+
+  for (let index = 0; index < uniqueWebTargets.length; index += 1) {
+    const target = uniqueWebTargets[index];
+    const webAttempt = await executeWebIdentifierAttempt({
+      attemptId: `public_web_${index + 1}`,
+      ...target
+    }, attempts, fingerprints);
+    if (webAttempt.ok) {
+      mergeIdentifierEvidence(evidenceStore, webAttempt.identifiers, { source: target.source });
+    }
+  }
+
+  const evidence = await verifyIdentifierEvidenceExhaustive(
+    mla,
+    [...allCatalogProductIds],
+    [...evidenceStore.values()],
+    attempts,
+    fingerprints
+  );
   const serializedIdentifiers = evidence
     .sort((a, b) => {
       if (a.verified !== b.verified) return a.verified ? -1 : 1;
@@ -1816,9 +2722,11 @@ async function resolveUpcsByMla(entry) {
   const candidateIdentifiers = serializedIdentifiers.filter(identifier => !identifier.verified);
   const primaryIdentifier = verifiedIdentifiers.find(identifier => identifier.type === "UPC") || verifiedIdentifiers[0] || null;
   const primaryUpc = verifiedIdentifiers.find(identifier => identifier.type === "UPC") || null;
-  const catalogScanComplete = catalogOffers.errors.length === 0 && !catalogOffers.paging?.has_more;
-  const itemScanComplete = itemDetails.errors.length === 0 && !itemDetails.truncated && itemDetails.available === itemDetails.requested;
-  const scanComplete = catalogScanComplete && itemScanComplete;
+  const itemScanComplete = !relatedItemsTruncated && [...visitedItemIds].every(itemId => accessibleItemIds.has(itemId));
+  const userProductScanComplete = !userProductScan.truncated && userProductScan.userProductIds.every(
+    userProductId => userProductScan.accessibleUserProductIds.includes(userProductId)
+  );
+  const scanComplete = catalogScansComplete && itemScanComplete && userProductScanComplete;
   let status = "identifier_not_available";
   let error = "";
   let warning = "";
@@ -1838,12 +2746,17 @@ async function resolveUpcsByMla(entry) {
 
   logger.info({
     catalog_product_id: mla,
-    identificadores_directos: directIdentifiers.length,
-    publicaciones_asociadas: associatedItemIds.length,
-    publicaciones_consultadas: itemDetails.available,
-    errores_publicaciones: itemDetails.errors.length,
+    productos_catalogo_consultados: allCatalogProductIds.size,
+    publicaciones_asociadas: visitedItemIds.size,
+    publicaciones_consultadas: accessibleItemIds.size,
+    publicaciones_con_acceso_denegado: [...forbiddenItemIds].filter(itemId => !accessibleItemIds.has(itemId)).length,
+    user_products_consultados: userProductScan.userProductIds.length,
+    familias_user_products_consultadas: userProductScan.familyIds.length,
+    paginas_web_consultadas: uniqueWebTargets.length,
+    imagenes_publicas_detectadas: allImageUrls.size,
     identificadores_verificados: verifiedIdentifiers.map(identifier => identifier.value),
     identificadores_candidatos: candidateIdentifiers.map(identifier => identifier.value),
+    intentos: buildAttemptSummary(attempts),
     recorrido_completo: scanComplete,
     estado: status
   }, "Finalizó el rastreo exhaustivo de identificadores por producto de catálogo");
@@ -1861,8 +2774,17 @@ async function resolveUpcsByMla(entry) {
     candidate_upcs: candidateIdentifiers.filter(identifier => identifier.type === "UPC").map(identifier => identifier.value),
     candidate_gtins: candidateIdentifiers.map(identifier => identifier.value),
     identifiers: serializedIdentifiers,
-    associated_items_found: associatedItemIds.length,
-    associated_items_scanned: itemDetails.available,
+    catalog_products_scanned: [...allCatalogProductIds],
+    associated_items_found: visitedItemIds.size,
+    associated_items_scanned: accessibleItemIds.size,
+    access_denied_items: [...forbiddenItemIds].filter(itemId => !accessibleItemIds.has(itemId)),
+    user_products_scanned: userProductScan.userProductIds,
+    user_product_families_scanned: userProductScan.familyIds,
+    public_web_pages_scanned: uniqueWebTargets.length,
+    public_images_detected: allImageUrls.size,
+    attempt_summary: buildAttemptSummary(attempts),
+    attempts: attempts.slice(0, 200),
+    attempts_truncated: attempts.length > 200,
     scan_complete: scanComplete,
     status,
     error,

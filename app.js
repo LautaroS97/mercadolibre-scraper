@@ -10,6 +10,7 @@ const pino = require("pino");
 const Bottleneck = require("bottleneck");
 const { v4: uuidv4 } = require("uuid");
 const crypto = require("crypto");
+const { Pool } = require("pg");
 
 const app = express();
 
@@ -33,6 +34,19 @@ const config = {
   wpSharedSecret: process.env.WP_SHARED_SECRET || "",
   n8nSharedSecret: process.env.N8N_SHARED_SECRET || "",
   n8nWebhookUrl: process.env.N8N_WEBHOOK_URL || "",
+  n8nBatchResultsWebhookUrl: process.env.N8N_BATCH_RESULTS_WEBHOOK_URL || "",
+  databaseUrl: process.env.DATABASE_URL || "",
+  databaseSsl: String(process.env.DATABASE_SSL || "false") === "true",
+  dbPoolMax: Math.max(1, Math.min(20, Number(process.env.DB_POOL_MAX || 5))),
+  batchWorkerIntervalMs: Math.max(250, Number(process.env.BATCH_WORKER_INTERVAL_MS || 1000)),
+  callbackWorkerIntervalMs: Math.max(500, Number(process.env.CALLBACK_WORKER_INTERVAL_MS || 2000)),
+  batchLeaseMs: Math.max(60000, Number(process.env.BATCH_LEASE_MS || 1000 * 60 * 30)),
+  callbackLeaseMs: Math.max(30000, Number(process.env.CALLBACK_LEASE_MS || 1000 * 60 * 2)),
+  batchMaxAttempts: Math.max(1, Number(process.env.BATCH_MAX_ATTEMPTS || 5)),
+  callbackMaxAttempts: Math.max(0, Number(process.env.CALLBACK_MAX_ATTEMPTS || 0)),
+  retryBaseMs: Math.max(1000, Number(process.env.RETRY_BASE_MS || 5000)),
+  retryMaxMs: Math.max(10000, Number(process.env.RETRY_MAX_MS || 1000 * 60 * 15)),
+  callbackTimeoutMs: Math.max(5000, Number(process.env.N8N_CALLBACK_TIMEOUT_MS || 30000)),
   meliClientId: process.env.MELI_CLIENT_ID || "",
   meliClientSecret: process.env.MELI_CLIENT_SECRET || "",
   meliRedirectUri: process.env.MELI_REDIRECT_URI || "",
@@ -85,6 +99,10 @@ let apiVerificationCache = {
 };
 let apiDiagnosticCount = 0;
 let lastTokenRefreshWarningAt = 0;
+let dbPool = null;
+let databaseReady = false;
+let batchWorkerRunning = false;
+let callbackWorkerRunning = false;
 
 const meliLimiter = new Bottleneck({
   maxConcurrent: config.meliConcurrency,
@@ -208,7 +226,9 @@ function publicJob(job) {
     created_at: job.created_at,
     started_at: job.started_at,
     finished_at: job.finished_at,
-    error: job.error
+    error: job.error,
+    total_batches: Number(job.total_batches || 0),
+    synced_batches: Number(job.synced_batches || 0)
   };
 }
 
@@ -231,8 +251,795 @@ function createEmptyJob(data) {
     created_at: data.created_at || nowIso(),
     started_at: null,
     finished_at: null,
-    error: ""
+    error: "",
+    total_batches: Number(data.total_batches || 0),
+    synced_batches: Number(data.synced_batches || 0)
   };
+}
+
+
+function dateToIso(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toISOString();
+}
+
+function jobFromRow(row) {
+  if (!row) return null;
+  return {
+    job_id: row.job_id,
+    job_type: row.job_type,
+    sheet_url: row.sheet_url || "",
+    sheet_name: row.sheet_name || "",
+    email: row.email || "",
+    status: row.status || "pending",
+    total: Number(row.total || 0),
+    processed: Number(row.processed || 0),
+    ok: Number(row.ok_count || 0),
+    not_found: Number(row.not_found || 0),
+    no_offers: Number(row.no_offers || 0),
+    api_errors: Number(row.api_errors || 0),
+    errors: Number(row.errors || 0),
+    updated_rows: Number(row.updated_rows || 0),
+    total_batches: Number(row.total_batches || 0),
+    synced_batches: Number(row.synced_batches || 0),
+    created_at: dateToIso(row.created_at),
+    started_at: dateToIso(row.started_at),
+    finished_at: dateToIso(row.finished_at),
+    error: row.error || ""
+  };
+}
+
+async function initializeDatabase() {
+  if (!config.databaseUrl) {
+    databaseReady = false;
+    return false;
+  }
+
+  dbPool = new Pool({
+    connectionString: config.databaseUrl,
+    ssl: config.databaseSsl ? { rejectUnauthorized: false } : false,
+    max: config.dbPoolMax
+  });
+
+  await dbPool.query("SELECT 1");
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS meli_monitor_jobs (
+      job_id TEXT PRIMARY KEY,
+      job_type TEXT NOT NULL,
+      sheet_url TEXT NOT NULL DEFAULT '',
+      sheet_name TEXT NOT NULL DEFAULT '',
+      email TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      total INTEGER NOT NULL DEFAULT 0,
+      processed INTEGER NOT NULL DEFAULT 0,
+      ok_count INTEGER NOT NULL DEFAULT 0,
+      not_found INTEGER NOT NULL DEFAULT 0,
+      no_offers INTEGER NOT NULL DEFAULT 0,
+      api_errors INTEGER NOT NULL DEFAULT 0,
+      errors INTEGER NOT NULL DEFAULT 0,
+      updated_rows INTEGER NOT NULL DEFAULT 0,
+      total_batches INTEGER NOT NULL DEFAULT 0,
+      synced_batches INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      started_at TIMESTAMPTZ,
+      finished_at TIMESTAMPTZ,
+      error TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS meli_monitor_batches (
+      batch_id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL REFERENCES meli_monitor_jobs(job_id) ON DELETE CASCADE,
+      job_type TEXT NOT NULL,
+      batch_index INTEGER NOT NULL,
+      total_batches INTEGER NOT NULL,
+      total_products INTEGER NOT NULL,
+      payload JSONB NOT NULL,
+      payload_hash TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      callback_attempts INTEGER NOT NULL DEFAULT 0,
+      results JSONB,
+      summary JSONB,
+      updated_rows INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      next_callback_at TIMESTAMPTZ,
+      lease_expires_at TIMESTAMPTZ,
+      callback_lease_expires_at TIMESTAMPTZ,
+      last_error TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      started_at TIMESTAMPTZ,
+      processed_at TIMESTAMPTZ,
+      synced_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(job_id, batch_index)
+    )
+  `);
+
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_meli_monitor_batches_processing
+    ON meli_monitor_batches(status, next_attempt_at, created_at)
+  `);
+
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_meli_monitor_batches_callback
+    ON meli_monitor_batches(status, next_callback_at, created_at)
+  `);
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS meli_monitor_state (
+      state_key TEXT PRIMARY KEY,
+      state_value JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  databaseReady = true;
+  return true;
+}
+
+async function saveJob(job) {
+  if (!databaseReady || !dbPool || !job) return;
+
+  await dbPool.query(`
+    INSERT INTO meli_monitor_jobs (
+      job_id, job_type, sheet_url, sheet_name, email, status, total,
+      processed, ok_count, not_found, no_offers, api_errors, errors,
+      updated_rows, total_batches, synced_batches, created_at, started_at,
+      finished_at, error, updated_at
+    ) VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+      COALESCE($17::timestamptz, NOW()),$18::timestamptz,$19::timestamptz,$20,NOW()
+    )
+    ON CONFLICT (job_id) DO UPDATE SET
+      job_type = EXCLUDED.job_type,
+      sheet_url = CASE WHEN EXCLUDED.sheet_url <> '' THEN EXCLUDED.sheet_url ELSE meli_monitor_jobs.sheet_url END,
+      sheet_name = CASE WHEN EXCLUDED.sheet_name <> '' THEN EXCLUDED.sheet_name ELSE meli_monitor_jobs.sheet_name END,
+      email = CASE WHEN EXCLUDED.email <> '' THEN EXCLUDED.email ELSE meli_monitor_jobs.email END,
+      status = EXCLUDED.status,
+      total = EXCLUDED.total,
+      processed = EXCLUDED.processed,
+      ok_count = EXCLUDED.ok_count,
+      not_found = EXCLUDED.not_found,
+      no_offers = EXCLUDED.no_offers,
+      api_errors = EXCLUDED.api_errors,
+      errors = EXCLUDED.errors,
+      updated_rows = EXCLUDED.updated_rows,
+      total_batches = GREATEST(meli_monitor_jobs.total_batches, EXCLUDED.total_batches),
+      synced_batches = EXCLUDED.synced_batches,
+      started_at = COALESCE(EXCLUDED.started_at, meli_monitor_jobs.started_at),
+      finished_at = EXCLUDED.finished_at,
+      error = EXCLUDED.error,
+      updated_at = NOW()
+  `, [
+    job.job_id,
+    job.job_type || "ean_to_mla",
+    job.sheet_url || "",
+    job.sheet_name || "",
+    job.email || "",
+    job.status || "pending",
+    Number(job.total || 0),
+    Number(job.processed || 0),
+    Number(job.ok || 0),
+    Number(job.not_found || 0),
+    Number(job.no_offers || 0),
+    Number(job.api_errors || 0),
+    Number(job.errors || 0),
+    Number(job.updated_rows || 0),
+    Number(job.total_batches || 0),
+    Number(job.synced_batches || 0),
+    job.created_at || null,
+    job.started_at || null,
+    job.finished_at || null,
+    job.error || ""
+  ]);
+}
+
+async function getPersistentJob(jobId) {
+  if (!databaseReady || !dbPool) return jobs.get(jobId) || null;
+  const result = await dbPool.query("SELECT * FROM meli_monitor_jobs WHERE job_id = $1", [jobId]);
+  const job = jobFromRow(result.rows[0]);
+  if (job) jobs.set(job.job_id, job);
+  return job;
+}
+
+async function persistMeliTokens() {
+  if (!databaseReady || !dbPool || !meliTokens.access_token) return;
+  await dbPool.query(`
+    INSERT INTO meli_monitor_state(state_key, state_value, updated_at)
+    VALUES ('meli_tokens', $1::jsonb, NOW())
+    ON CONFLICT (state_key) DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = NOW()
+  `, [JSON.stringify(meliTokens)]);
+}
+
+async function loadMeliTokensFromDatabase() {
+  if (!databaseReady || !dbPool) return;
+  const result = await dbPool.query("SELECT state_value FROM meli_monitor_state WHERE state_key = 'meli_tokens'");
+  const stored = result.rows[0]?.state_value;
+  if (!stored || typeof stored !== "object") return;
+
+  meliTokens = {
+    access_token: stored.access_token || meliTokens.access_token || "",
+    refresh_token: stored.refresh_token || meliTokens.refresh_token || "",
+    expires_at: Number(stored.expires_at || meliTokens.expires_at || 0),
+    user_id: stored.user_id ? String(stored.user_id) : meliTokens.user_id || ""
+  };
+}
+
+function payloadHash(value) {
+  return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function retryDelayMs(attempt) {
+  const exponential = Math.min(config.retryMaxMs, config.retryBaseMs * Math.pow(2, Math.max(0, attempt - 1)));
+  const jitter = Math.floor(Math.random() * Math.min(1000, Math.max(1, exponential * 0.2)));
+  return exponential + jitter;
+}
+
+async function ensurePersistentJobForBatch(jobId, jobType, totalProducts, totalBatches) {
+  let job = await getPersistentJob(jobId);
+
+  if (!job) {
+    job = createEmptyJob({
+      job_id: jobId,
+      job_type: jobType,
+      status: "queued",
+      total: totalProducts,
+      total_batches: totalBatches
+    });
+    job.started_at = nowIso();
+    await saveJob(job);
+    jobs.set(job.job_id, job);
+    return job;
+  }
+
+  const updated = await dbPool.query(`
+    UPDATE meli_monitor_jobs
+    SET job_type = $2,
+        total = GREATEST(total, $3),
+        total_batches = GREATEST(total_batches, $4),
+        status = CASE
+          WHEN status IN ('completed', 'completed_with_errors', 'failed') THEN status
+          ELSE 'queued'
+        END,
+        started_at = COALESCE(started_at, NOW()),
+        finished_at = CASE
+          WHEN status IN ('completed', 'completed_with_errors', 'failed') THEN finished_at
+          ELSE NULL
+        END,
+        error = CASE
+          WHEN status IN ('completed', 'completed_with_errors', 'failed') THEN error
+          ELSE ''
+        END,
+        updated_at = NOW()
+    WHERE job_id = $1
+    RETURNING *
+  `, [jobId, jobType, Number(totalProducts || 0), Number(totalBatches || 0)]);
+
+  job = jobFromRow(updated.rows[0]);
+  if (job) jobs.set(job.job_id, job);
+  return job;
+}
+
+async function enqueuePersistentBatch({ jobId, jobType, batchIndex, totalBatches, totalProducts, payload }) {
+  if (!databaseReady || !dbPool) {
+    throw apiError("PostgreSQL no está configurado o disponible", { code: "database_not_ready", status: 503 });
+  }
+  if (!Number.isInteger(batchIndex) || batchIndex < 1) {
+    throw apiError("batch_index inválido", { code: "invalid_batch_index", status: 400 });
+  }
+  if (!Number.isInteger(totalBatches) || totalBatches < 1) {
+    throw apiError("total_batches inválido", { code: "invalid_total_batches", status: 400 });
+  }
+
+  const job = await ensurePersistentJobForBatch(jobId, jobType, totalProducts, totalBatches);
+  const hash = payloadHash(payload);
+  const batchId = `batch_${jobId}_${batchIndex}_${uuidv4().replace(/-/g, "").slice(0, 8)}`;
+
+  const inserted = await dbPool.query(`
+    INSERT INTO meli_monitor_batches (
+      batch_id, job_id, job_type, batch_index, total_batches, total_products,
+      payload, payload_hash, status, next_attempt_at, created_at, updated_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,'pending',NOW(),NOW(),NOW())
+    ON CONFLICT (job_id, batch_index) DO NOTHING
+    RETURNING *
+  `, [
+    batchId,
+    jobId,
+    jobType,
+    batchIndex,
+    totalBatches,
+    totalProducts,
+    JSON.stringify(payload),
+    hash
+  ]);
+
+  if (inserted.rows.length) {
+    return { duplicate: false, batch: inserted.rows[0], job };
+  }
+
+  const existingResult = await dbPool.query(
+    "SELECT * FROM meli_monitor_batches WHERE job_id = $1 AND batch_index = $2",
+    [jobId, batchIndex]
+  );
+  const existing = existingResult.rows[0];
+
+  if (!existing) {
+    throw apiError("No se pudo recuperar la tanda existente", { code: "batch_lookup_failed", status: 500 });
+  }
+
+  if (existing.payload_hash !== hash) {
+    throw apiError("Ya existe una tanda con el mismo job_id y batch_index pero contenido diferente", {
+      code: "batch_conflict",
+      status: 409
+    });
+  }
+
+  return { duplicate: true, batch: existing, job };
+}
+
+async function claimNextBatch() {
+  const client = await dbPool.connect();
+  try {
+    await client.query("BEGIN");
+    const selected = await client.query(`
+      SELECT *
+      FROM meli_monitor_batches
+      WHERE (
+        (status = 'pending' AND next_attempt_at <= NOW())
+        OR (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= NOW())
+      )
+      ORDER BY created_at ASC, batch_index ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+    `);
+
+    if (!selected.rows.length) {
+      await client.query("COMMIT");
+      return null;
+    }
+
+    const batch = selected.rows[0];
+    const updated = await client.query(`
+      UPDATE meli_monitor_batches
+      SET status = 'processing',
+          attempts = attempts + 1,
+          started_at = COALESCE(started_at, NOW()),
+          lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 millisecond'),
+          last_error = '',
+          updated_at = NOW()
+      WHERE batch_id = $1
+      RETURNING *
+    `, [batch.batch_id, config.batchLeaseMs]);
+
+    await client.query("COMMIT");
+    return updated.rows[0] || null;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function startBatchLeaseHeartbeat(batchId) {
+  const intervalMs = Math.max(15000, Math.floor(config.batchLeaseMs / 3));
+  const timer = setInterval(() => {
+    dbPool.query(`
+      UPDATE meli_monitor_batches
+      SET lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 millisecond'), updated_at = NOW()
+      WHERE batch_id = $1 AND status = 'processing'
+    `, [batchId, config.batchLeaseMs]).catch(error => {
+      logger.error({ batch_id: batchId, error: error.message }, "No se pudo renovar el lease de una tanda");
+    });
+  }, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+function buildUpcBatchSummary(results, requested) {
+  const apiErrors = results.filter(result => String(result.status || "").startsWith("api_")).length;
+  return {
+    requested,
+    processed: results.length,
+    found: results.filter(result => result.status === "ok").length,
+    without_identifier: results.filter(result => ["identifier_not_available", "identifier_candidates", "partial_scan"].includes(result.status)).length,
+    with_candidates: results.filter(result => result.status === "identifier_candidates").length,
+    partial_scans: results.filter(result => result.status === "partial_scan").length,
+    invalid: results.filter(result => result.status === "invalid_mla").length,
+    not_found: results.filter(result => result.status === "item_not_found").length,
+    api_errors: apiErrors,
+    errors: results.filter(result => !["ok", "identifier_not_available", "identifier_candidates", "partial_scan", "invalid_mla", "item_not_found"].includes(result.status)).length
+  };
+}
+
+async function processQueuedBatch(batch) {
+  const stopHeartbeat = startBatchLeaseHeartbeat(batch.batch_id);
+  try {
+    const verification = await verifyMeliApiConnection(false);
+    if (!verification.ok) {
+      throw apiError(`MercadoLibre no está disponible: ${verification.status}`, {
+        code: "meli_api_not_ready",
+        status: 503,
+        retryable: true
+      });
+    }
+
+    const payload = batch.payload || {};
+    const inputs = Array.isArray(payload.products) ? payload.products : [];
+    let results;
+    let summary;
+
+    if (batch.job_type === "mla_to_upc") {
+      results = await mapWithConcurrency(inputs, config.productConcurrency, async entry => {
+        try {
+          return await resolveUpcsByMla(entry);
+        } catch (error) {
+          const rawMla = entry && typeof entry === "object" ? entry.mla : entry;
+          return {
+            row_number: entry && typeof entry === "object" ? entry.row_number || null : null,
+            input: String(rawMla || ""),
+            mla: normalizeMlaId(rawMla),
+            title: "",
+            catalog_product_id: null,
+            primary_identifier: null,
+            upc: null,
+            upcs: [],
+            gtins: [],
+            candidate_upcs: [],
+            candidate_gtins: [],
+            identifiers: [],
+            status: "unexpected_error",
+            error: String(error.message || error).slice(0, 1000),
+            checked_at: nowIso()
+          };
+        }
+      });
+      summary = buildUpcBatchSummary(results, inputs.length);
+    } else {
+      results = await mapWithConcurrency(inputs, config.productConcurrency, async row => {
+        try {
+          return await resolveProduct(row);
+        } catch (error) {
+          const ean = normalizeEan(row.ean);
+          logger.error({
+            job_id: batch.job_id,
+            batch_id: batch.batch_id,
+            row_number: row.row_number,
+            ean,
+            error: error.message
+          }, "Falló inesperadamente el procesamiento de un producto en background");
+          return resultError(row, ean, "unexpected_error", error.message);
+        }
+      });
+      summary = countBatchResults(results);
+    }
+
+    await dbPool.query(`
+      UPDATE meli_monitor_batches
+      SET status = 'callback_pending',
+          results = $2::jsonb,
+          summary = $3::jsonb,
+          processed_at = NOW(),
+          next_callback_at = NOW(),
+          lease_expires_at = NULL,
+          last_error = '',
+          updated_at = NOW()
+      WHERE batch_id = $1
+    `, [batch.batch_id, JSON.stringify(results), JSON.stringify(summary)]);
+
+    logger.info({
+      job_id: batch.job_id,
+      batch_id: batch.batch_id,
+      indice_tanda: batch.batch_index,
+      total_tandas: batch.total_batches,
+      procesados: results.length
+    }, "La tanda asíncrona terminó y quedó lista para sincronizar con n8n");
+
+    await refreshJobAggregates(batch.job_id);
+  } catch (error) {
+    const attempts = Number(batch.attempts || 1);
+    const exhausted = attempts >= config.batchMaxAttempts;
+    const delayMs = retryDelayMs(attempts);
+
+    await dbPool.query(`
+      UPDATE meli_monitor_batches
+      SET status = $2,
+          next_attempt_at = CASE WHEN $2 = 'pending' THEN NOW() + ($3::bigint * INTERVAL '1 millisecond') ELSE next_attempt_at END,
+          lease_expires_at = NULL,
+          last_error = $4,
+          updated_at = NOW()
+      WHERE batch_id = $1
+    `, [batch.batch_id, exhausted ? "failed" : "pending", delayMs, String(error.message || error).slice(0, 2000)]);
+
+    logger.error({
+      job_id: batch.job_id,
+      batch_id: batch.batch_id,
+      intento: attempts,
+      agotado: exhausted,
+      reintento_en_ms: exhausted ? null : delayMs,
+      error: error.message
+    }, exhausted ? "La tanda asíncrona falló definitivamente" : "La tanda asíncrona falló y será reintentada");
+
+    await refreshJobAggregates(batch.job_id);
+  } finally {
+    stopHeartbeat();
+  }
+}
+
+async function claimNextCallback() {
+  const client = await dbPool.connect();
+  try {
+    await client.query("BEGIN");
+    const selected = await client.query(`
+      SELECT *
+      FROM meli_monitor_batches
+      WHERE (
+        (status = 'callback_pending' AND COALESCE(next_callback_at, NOW()) <= NOW())
+        OR (status = 'callback_delivering' AND callback_lease_expires_at IS NOT NULL AND callback_lease_expires_at <= NOW())
+      )
+      ORDER BY processed_at ASC NULLS LAST, created_at ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+    `);
+
+    if (!selected.rows.length) {
+      await client.query("COMMIT");
+      return null;
+    }
+
+    const batch = selected.rows[0];
+    const updated = await client.query(`
+      UPDATE meli_monitor_batches
+      SET status = 'callback_delivering',
+          callback_attempts = callback_attempts + 1,
+          callback_lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 millisecond'),
+          updated_at = NOW()
+      WHERE batch_id = $1
+      RETURNING *
+    `, [batch.batch_id, config.callbackLeaseMs]);
+
+    await client.query("COMMIT");
+    return updated.rows[0] || null;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function deliverBatchCallback(batch) {
+  try {
+    if (!config.n8nBatchResultsWebhookUrl) {
+      throw new Error("Falta N8N_BATCH_RESULTS_WEBHOOK_URL");
+    }
+
+    const job = await getPersistentJob(batch.job_id);
+    if (!job) throw new Error("job_not_found");
+
+    const payload = {
+      event: "batch.completed",
+      job_id: batch.job_id,
+      job_type: batch.job_type,
+      batch_id: batch.batch_id,
+      batch_index: Number(batch.batch_index),
+      total_batches: Number(batch.total_batches),
+      total_products: Number(batch.total_products),
+      sheet_url: job.sheet_url,
+      sheet_name: job.sheet_name,
+      batch_summary: batch.summary || {},
+      results: Array.isArray(batch.results) ? batch.results : [],
+      processed_at: dateToIso(batch.processed_at)
+    };
+
+    const response = await http.post(config.n8nBatchResultsWebhookUrl, payload, {
+      timeout: config.callbackTimeoutMs,
+      headers: {
+        "Content-Type": "application/json",
+        "X-App-Secret": config.n8nSharedSecret
+      }
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`n8n_batch_callback_http_${response.status}`);
+    }
+
+    const updatedRows = Number(response.data?.updated_rows || 0);
+
+    await dbPool.query(`
+      UPDATE meli_monitor_batches
+      SET status = 'synced',
+          updated_rows = $2,
+          synced_at = NOW(),
+          callback_lease_expires_at = NULL,
+          last_error = '',
+          updated_at = NOW()
+      WHERE batch_id = $1
+    `, [batch.batch_id, Number.isFinite(updatedRows) && updatedRows >= 0 ? updatedRows : 0]);
+
+    logger.info({
+      job_id: batch.job_id,
+      batch_id: batch.batch_id,
+      indice_tanda: batch.batch_index,
+      filas_actualizadas: Number.isFinite(updatedRows) ? updatedRows : 0
+    }, "n8n confirmó la actualización de Google Sheets para la tanda");
+
+    await refreshJobAggregates(batch.job_id);
+  } catch (error) {
+    const attempts = Number(batch.callback_attempts || 1);
+    const exhausted = config.callbackMaxAttempts > 0 && attempts >= config.callbackMaxAttempts;
+    const delayMs = retryDelayMs(attempts);
+
+    await dbPool.query(`
+      UPDATE meli_monitor_batches
+      SET status = $2,
+          next_callback_at = CASE WHEN $2 = 'callback_pending' THEN NOW() + ($3::bigint * INTERVAL '1 millisecond') ELSE next_callback_at END,
+          callback_lease_expires_at = NULL,
+          last_error = $4,
+          updated_at = NOW()
+      WHERE batch_id = $1
+    `, [batch.batch_id, exhausted ? "callback_failed" : "callback_pending", delayMs, String(error.message || error).slice(0, 2000)]);
+
+    logger.error({
+      job_id: batch.job_id,
+      batch_id: batch.batch_id,
+      intento_callback: attempts,
+      agotado: exhausted,
+      reintento_en_ms: exhausted ? null : delayMs,
+      error: error.message
+    }, exhausted ? "El callback de la tanda a n8n falló definitivamente" : "El callback de la tanda a n8n falló y será reintentado");
+
+    await refreshJobAggregates(batch.job_id);
+  }
+}
+
+async function refreshJobAggregates(jobId) {
+  const jobResult = await dbPool.query("SELECT * FROM meli_monitor_jobs WHERE job_id = $1", [jobId]);
+  if (!jobResult.rows.length) return null;
+  const current = jobFromRow(jobResult.rows[0]);
+  const batchResult = await dbPool.query(`
+    SELECT status, summary, updated_rows, total_batches, total_products
+    FROM meli_monitor_batches
+    WHERE job_id = $1
+    ORDER BY batch_index ASC
+  `, [jobId]);
+
+  const rows = batchResult.rows;
+  let processed = 0;
+  let ok = 0;
+  let notFound = 0;
+  let noOffers = 0;
+  let apiErrors = 0;
+  let errors = 0;
+  let updatedRows = 0;
+  let syncedBatches = 0;
+  let failedBatches = 0;
+
+  for (const row of rows) {
+    const summary = row.summary || {};
+    processed += Number(summary.processed || 0);
+    updatedRows += Number(row.updated_rows || 0);
+    if (row.status === "synced") syncedBatches += 1;
+    if (["failed", "callback_failed"].includes(row.status)) failedBatches += 1;
+
+    if (current.job_type === "mla_to_upc") {
+      ok += Number(summary.found || 0);
+      notFound += Number(summary.not_found || 0);
+      noOffers += Number(summary.without_identifier || 0);
+      apiErrors += Number(summary.api_errors || 0);
+      errors += Number(summary.errors || 0);
+    } else {
+      ok += Number(summary.ok || 0);
+      notFound += Number(summary.product_not_found || 0);
+      noOffers += Number(summary.offers_not_found || 0) + Number(summary.catalog_only || 0);
+      apiErrors += Number(summary.api_errors || 0);
+      errors += Number(summary.catalog_only || 0)
+        + Number(summary.product_not_found || 0)
+        + Number(summary.offers_not_found || 0)
+        + Number(summary.invalid_ean || 0)
+        + Number(summary.api_errors || 0)
+        + Number(summary.other_errors || 0);
+    }
+  }
+
+  const totalBatches = Math.max(
+    Number(current.total_batches || 0),
+    ...rows.map(row => Number(row.total_batches || 0)),
+    0
+  );
+  const terminalBatches = syncedBatches + failedBatches;
+  const allBatchesKnown = totalBatches > 0 && rows.length >= totalBatches;
+  const allTerminal = allBatchesKnown && terminalBatches >= totalBatches;
+  let status = rows.length ? "processing" : current.status;
+  let finishedAt = null;
+  let error = "";
+
+  if (allTerminal) {
+    if (failedBatches === 0) {
+      status = "completed";
+    } else if (syncedBatches === 0) {
+      status = "failed";
+      error = `${failedBatches} tanda(s) no pudieron completarse o sincronizarse`;
+    } else {
+      status = "completed_with_errors";
+      error = `${failedBatches} tanda(s) no pudieron completarse o sincronizarse`;
+    }
+    finishedAt = nowIso();
+  }
+
+  const updated = await dbPool.query(`
+    UPDATE meli_monitor_jobs
+    SET status = $2,
+        processed = $3,
+        ok_count = $4,
+        not_found = $5,
+        no_offers = $6,
+        api_errors = $7,
+        errors = $8,
+        updated_rows = $9,
+        total_batches = $10,
+        synced_batches = $11,
+        started_at = COALESCE(started_at, NOW()),
+        finished_at = $12::timestamptz,
+        error = $13,
+        updated_at = NOW()
+    WHERE job_id = $1
+    RETURNING *
+  `, [
+    jobId,
+    status,
+    processed,
+    ok,
+    notFound,
+    noOffers,
+    apiErrors,
+    errors,
+    updatedRows,
+    totalBatches,
+    syncedBatches,
+    finishedAt,
+    error
+  ]);
+
+  const job = jobFromRow(updated.rows[0]);
+  if (job) jobs.set(job.job_id, job);
+  return job;
+}
+
+async function runBatchWorkerCycle() {
+  if (!databaseReady || batchWorkerRunning) return;
+  batchWorkerRunning = true;
+  let claimed = null;
+  try {
+    claimed = await claimNextBatch();
+    if (claimed) await processQueuedBatch(claimed);
+  } catch (error) {
+    logger.error({ error: error.message }, "Falló el ciclo del worker de tandas");
+  } finally {
+    batchWorkerRunning = false;
+  }
+  if (claimed) setImmediate(() => runBatchWorkerCycle().catch(() => {}));
+}
+
+async function runCallbackWorkerCycle() {
+  if (!databaseReady || callbackWorkerRunning) return;
+  callbackWorkerRunning = true;
+  let claimed = null;
+  try {
+    claimed = await claimNextCallback();
+    if (claimed) await deliverBatchCallback(claimed);
+  } catch (error) {
+    logger.error({ error: error.message }, "Falló el ciclo del worker de callbacks");
+  } finally {
+    callbackWorkerRunning = false;
+  }
+  if (claimed) setImmediate(() => runCallbackWorkerCycle().catch(() => {}));
 }
 
 function isGoogleSheetUrl(url) {
@@ -398,6 +1205,7 @@ async function exchangeMeliToken(payload) {
     campos_respuesta: Object.keys(data).filter(key => !["access_token", "refresh_token"].includes(key))
   }, "El token OAuth de MercadoLibre fue actualizado correctamente");
 
+  await persistMeliTokens();
   return meliTokens;
 }
 
@@ -2891,6 +3699,8 @@ app.get("/", (req, res) => {
     oauth_start: "/auth/mercadolibre/start",
     ean_job_start: "/jobs",
     upc_job_start: "/upc-jobs",
+    ean_queue: "/monitor/queue",
+    upc_queue: "/lookup-upcs/queue",
     upc_lookup: "/lookup-upcs"
   });
 });
@@ -2913,7 +3723,9 @@ app.get("/health", (req, res) => {
     automatic_refresh_available: Boolean(meliTokens.refresh_token),
     api_status: apiVerificationCache.status,
     api_user_id: apiVerificationCache.user_id || null,
-    api_error: apiVerificationCache.error || ""
+    api_error: apiVerificationCache.error || "",
+    database_ready: databaseReady,
+    batch_callback_configured: Boolean(config.n8nBatchResultsWebhookUrl)
   });
 });
 
@@ -2976,6 +3788,106 @@ app.post("/meli/test-product", requireN8n, async (req, res) => {
   });
 });
 
+
+app.post("/monitor/queue", requireN8n, async (req, res) => {
+  try {
+    const parsed = monitorSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ ok: false, error: "invalid_payload", details: parsed.error.flatten() });
+    }
+
+    const body = parsed.data;
+    if (body.products.length > config.maxProductsPerRequest) {
+      return res.status(400).json({ ok: false, error: "too_many_products", max: config.maxProductsPerRequest });
+    }
+
+    const batchIndex = Number(body.batch_index || 0);
+    const totalBatches = Number(body.total_batches || 0);
+    const totalProducts = Number(body.total_products || body.products.length);
+    const queued = await enqueuePersistentBatch({
+      jobId: body.job_id,
+      jobType: "ean_to_mla",
+      batchIndex,
+      totalBatches,
+      totalProducts,
+      payload: { products: body.products }
+    });
+
+    setImmediate(() => runBatchWorkerCycle().catch(() => {}));
+
+    return res.status(202).json({
+      ok: true,
+      accepted: true,
+      duplicate: queued.duplicate,
+      batch: {
+        batch_id: queued.batch.batch_id,
+        batch_index: Number(queued.batch.batch_index),
+        total_batches: Number(queued.batch.total_batches),
+        status: queued.batch.status
+      },
+      job: publicJob(await getPersistentJob(body.job_id))
+    });
+  } catch (error) {
+    logger.error({ error: error.message, codigo: error.code || "queue_error" }, "No se pudo encolar una tanda EAN a MLA");
+    return res.status(error.status && error.status >= 400 && error.status < 600 ? error.status : 500).json({
+      ok: false,
+      error: error.code || "queue_error",
+      message: error.message
+    });
+  }
+});
+
+app.post("/lookup-upcs/queue", requireN8n, async (req, res) => {
+  try {
+    const parsed = upcLookupSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ ok: false, error: "invalid_payload", details: parsed.error.flatten() });
+    }
+
+    const body = parsed.data;
+    if (!body.job_id) {
+      return res.status(400).json({ ok: false, error: "job_id_required" });
+    }
+
+    const inputs = body.products.length
+      ? body.products
+      : [...new Set(body.mlas.map(value => String(value).trim()))].map((mla, index) => ({ row_number: index + 1, mla }));
+    const batchIndex = Number(body.batch_index || 0);
+    const totalBatches = Number(body.total_batches || 0);
+    const totalProducts = Number(body.total_products || inputs.length);
+    const queued = await enqueuePersistentBatch({
+      jobId: body.job_id,
+      jobType: "mla_to_upc",
+      batchIndex,
+      totalBatches,
+      totalProducts,
+      payload: { products: inputs }
+    });
+
+    setImmediate(() => runBatchWorkerCycle().catch(() => {}));
+
+    return res.status(202).json({
+      ok: true,
+      accepted: true,
+      duplicate: queued.duplicate,
+      batch: {
+        batch_id: queued.batch.batch_id,
+        batch_index: Number(queued.batch.batch_index),
+        total_batches: Number(queued.batch.total_batches),
+        status: queued.batch.status
+      },
+      job: publicJob(await getPersistentJob(body.job_id))
+    });
+  } catch (error) {
+    logger.error({ error: error.message, codigo: error.code || "queue_error" }, "No se pudo encolar una tanda MLA a UPC");
+    return res.status(error.status && error.status >= 400 && error.status < 600 ? error.status : 500).json({
+      ok: false,
+      error: error.code || "queue_error",
+      message: error.message
+    });
+  }
+});
+
 app.post("/lookup-upcs", requireWpOrN8n, async (req, res) => {
   try {
     const parsed = upcLookupSchema.safeParse(req.body);
@@ -3004,7 +3916,7 @@ app.post("/lookup-upcs", requireWpOrN8n, async (req, res) => {
     const inputs = body.products.length
       ? body.products
       : [...new Set(body.mlas.map(value => String(value).trim()))];
-    let job = body.job_id ? jobs.get(body.job_id) : null;
+    let job = body.job_id ? await getPersistentJob(body.job_id) : null;
 
     if (body.job_id && !job) {
       job = createEmptyJob({
@@ -3015,6 +3927,7 @@ app.post("/lookup-upcs", requireWpOrN8n, async (req, res) => {
       });
       job.started_at = nowIso();
       jobs.set(job.job_id, job);
+      await saveJob(job);
     }
 
     if (job) {
@@ -3048,6 +3961,7 @@ app.post("/lookup-upcs", requireWpOrN8n, async (req, res) => {
       job.no_offers += summary.without_identifier;
       job.api_errors += summary.api_errors;
       job.errors += summary.errors;
+      await saveJob(job);
     }
 
     logger.info({
@@ -3136,13 +4050,16 @@ app.post("/jobs", requireWp, async (req, res) => {
     });
 
     jobs.set(job.job_id, job);
+    await saveJob(job);
 
     try {
       await notifyN8nJobCreated(job);
       job.status = "sent_to_n8n";
+      await saveJob(job);
     } catch (error) {
       job.status = "n8n_error";
       job.error = error.message;
+      await saveJob(job);
       logger.error({ job_id: job.job_id, error: error.message }, "No se pudo iniciar el workflow de n8n");
       return res.status(502).json({
         ok: false,
@@ -3219,13 +4136,16 @@ app.post("/upc-jobs", requireWp, async (req, res) => {
     });
 
     jobs.set(job.job_id, job);
+    await saveJob(job);
 
     try {
       await notifyN8nJobCreated(job);
       job.status = "sent_to_n8n";
+      await saveJob(job);
     } catch (error) {
       job.status = "n8n_error";
       job.error = error.message;
+      await saveJob(job);
       logger.error({ job_id: job.job_id, error: error.message }, "No se pudo iniciar el workflow MLA a UPC de n8n");
       return res.status(502).json({
         ok: false,
@@ -3253,8 +4173,8 @@ app.post("/upc-jobs", requireWp, async (req, res) => {
   }
 });
 
-app.get("/jobs/:jobId", requireWp, (req, res) => {
-  const job = jobs.get(req.params.jobId);
+app.get("/jobs/:jobId", requireWp, async (req, res) => {
+  const job = await getPersistentJob(req.params.jobId);
 
   if (!job) {
     return res.status(404).json({
@@ -3310,7 +4230,7 @@ app.post("/monitor", requireN8n, async (req, res) => {
       });
     }
 
-    let job = jobs.get(body.job_id);
+    let job = await getPersistentJob(body.job_id);
 
     if (!job) {
       job = createEmptyJob({
@@ -3320,6 +4240,7 @@ app.post("/monitor", requireN8n, async (req, res) => {
       });
       job.started_at = nowIso();
       jobs.set(job.job_id, job);
+      await saveJob(job);
     }
 
     job.status = "processing";
@@ -3365,6 +4286,7 @@ app.post("/monitor", requireN8n, async (req, res) => {
     job.no_offers += summary.offers_not_found + summary.catalog_only;
     job.api_errors += summary.api_errors;
     job.errors += summary.catalog_only + summary.product_not_found + summary.offers_not_found + summary.invalid_ean + summary.api_errors + summary.other_errors;
+    await saveJob(job);
 
     logger.info({
       job_id: job.job_id,
@@ -3405,7 +4327,7 @@ app.post("/monitor", requireN8n, async (req, res) => {
   }
 });
 
-app.post("/n8n/callback", requireN8n, (req, res) => {
+app.post("/n8n/callback", requireN8n, async (req, res) => {
   const parsed = callbackSchema.safeParse(req.body);
 
   if (!parsed.success) {
@@ -3417,7 +4339,7 @@ app.post("/n8n/callback", requireN8n, (req, res) => {
   }
 
   const body = parsed.data;
-  const job = jobs.get(body.job_id);
+  const job = await getPersistentJob(body.job_id);
 
   if (!job) {
     return res.status(404).json({
@@ -3426,8 +4348,7 @@ app.post("/n8n/callback", requireN8n, (req, res) => {
     });
   }
 
-  const requestedStatus = body.status;
-  job.status = requestedStatus;
+  job.status = body.status;
   job.updated_rows = job.ok === 0 ? 0 : Math.min(body.updated_rows, job.ok);
   job.finished_at = nowIso();
 
@@ -3439,6 +4360,9 @@ app.post("/n8n/callback", requireN8n, (req, res) => {
     job.error = "";
   }
 
+  jobs.set(job.job_id, job);
+  await saveJob(job);
+
   logger.info({
     job_id: job.job_id,
     estado_final: job.status,
@@ -3449,7 +4373,7 @@ app.post("/n8n/callback", requireN8n, (req, res) => {
     errores_api: job.api_errors,
     errores: job.errors,
     filas_actualizadas: job.updated_rows
-  }, "El job finalizó y n8n ejecutó el callback");
+  }, "El job finalizó y n8n ejecutó el callback legacy");
 
   return res.json({
     ok: true,
@@ -3630,40 +4554,78 @@ app.use((error, req, res, next) => {
   });
 });
 
-app.listen(config.port, async () => {
-  logger.info({
-    port: config.port,
-    site_id: config.meliSiteId,
-    auth_mode: config.meliAuthMode,
-    modo: "mercadolibre_api_only",
-    credenciales_configuradas: hasMeliCredentials(),
-    access_token_presente: hasMeliToken(),
-    refresh_token_presente: Boolean(meliTokens.refresh_token),
-    concurrencia: config.meliConcurrency,
-    concurrencia_productos: config.productConcurrency,
-    intervalo_minimo_ms: config.meliMinTimeMs,
-    preflight_obligatorio: config.requireApiPreflight,
-    tamano_pagina_catalogo: config.catalogItemsPageSize,
-    maximo_paginas_catalogo: config.maxCatalogItemPages,
-    cache_resultados_exitosos: config.cacheSuccessfulResults,
-    logs_muestra_catalogo: config.logCatalogSamples,
-    anticipacion_renovacion_ms: config.tokenRefreshLeadMs,
-    intervalo_revision_token_ms: config.tokenCheckIntervalMs
-  }, "Microservicio iniciado en modo exclusivo API de MercadoLibre");
-
-  const verification = await verifyMeliApiConnection(true);
-
-  if (!verification.ok) {
-    logger.warn({
-      estado_api: verification.status,
-      error_api: verification.error,
-      oauth_start_url: `${config.appBaseUrl}/auth/mercadolibre/start`
-    }, "El microservicio inició, pero la API de MercadoLibre todavía no está lista");
+async function startService() {
+  try {
+    await initializeDatabase();
+    if (databaseReady) {
+      await loadMeliTokensFromDatabase();
+    } else {
+      logger.warn({}, "DATABASE_URL no está configurada. Los endpoints legacy seguirán disponibles, pero la cola asíncrona permanecerá deshabilitada.");
+    }
+  } catch (error) {
+    databaseReady = false;
+    logger.error({ error: error.message }, "No se pudo inicializar PostgreSQL. Los endpoints legacy seguirán disponibles, pero la cola asíncrona permanecerá deshabilitada.");
   }
 
-  setInterval(() => {
-    checkAndRefreshMeliToken().catch(error => {
-      logger.error({ error: error.message }, "Falló la revisión programada del token de MercadoLibre");
-    });
-  }, config.tokenCheckIntervalMs).unref();
+  app.listen(config.port, async () => {
+    logger.info({
+      port: config.port,
+      site_id: config.meliSiteId,
+      auth_mode: config.meliAuthMode,
+      modo: "mercadolibre_api_only_async_jobs",
+      database_ready: databaseReady,
+      batch_callback_configured: Boolean(config.n8nBatchResultsWebhookUrl),
+      credenciales_configuradas: hasMeliCredentials(),
+      access_token_presente: hasMeliToken(),
+      refresh_token_presente: Boolean(meliTokens.refresh_token),
+      concurrencia: config.meliConcurrency,
+      concurrencia_productos: config.productConcurrency,
+      intervalo_minimo_ms: config.meliMinTimeMs,
+      max_intentos_tanda: config.batchMaxAttempts,
+      max_intentos_callback: config.callbackMaxAttempts || "sin_limite",
+      preflight_obligatorio: config.requireApiPreflight,
+      tamano_pagina_catalogo: config.catalogItemsPageSize,
+      maximo_paginas_catalogo: config.maxCatalogItemPages,
+      cache_resultados_exitosos: config.cacheSuccessfulResults,
+      logs_muestra_catalogo: config.logCatalogSamples,
+      anticipacion_renovacion_ms: config.tokenRefreshLeadMs,
+      intervalo_revision_token_ms: config.tokenCheckIntervalMs
+    }, "Microservicio iniciado con cola persistente de PostgreSQL");
+
+    const verification = await verifyMeliApiConnection(true);
+
+    if (!verification.ok) {
+      logger.warn({
+        estado_api: verification.status,
+        error_api: verification.error,
+        oauth_start_url: `${config.appBaseUrl}/auth/mercadolibre/start`
+      }, "El microservicio inició, pero la API de MercadoLibre todavía no está lista");
+    }
+
+    setInterval(() => {
+      checkAndRefreshMeliToken().catch(error => {
+        logger.error({ error: error.message }, "Falló la revisión programada del token de MercadoLibre");
+      });
+    }, config.tokenCheckIntervalMs).unref();
+
+    setInterval(() => {
+      runBatchWorkerCycle().catch(error => {
+        logger.error({ error: error.message }, "Falló la ejecución programada del worker de tandas");
+      });
+    }, config.batchWorkerIntervalMs).unref();
+
+    setInterval(() => {
+      runCallbackWorkerCycle().catch(error => {
+        logger.error({ error: error.message }, "Falló la ejecución programada del worker de callbacks");
+      });
+    }, config.callbackWorkerIntervalMs).unref();
+
+    setImmediate(() => runBatchWorkerCycle().catch(() => {}));
+    setImmediate(() => runCallbackWorkerCycle().catch(() => {}));
+  });
+}
+
+startService().catch(error => {
+  logger.fatal({ error: error.message }, "Falló el arranque del microservicio");
+  process.exit(1);
 });

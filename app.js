@@ -50,7 +50,7 @@ const config = {
   meliClientId: process.env.MELI_CLIENT_ID || "",
   meliClientSecret: process.env.MELI_CLIENT_SECRET || "",
   meliRedirectUri: process.env.MELI_REDIRECT_URI || "",
-  meliSiteId: process.env.MELI_SITE_ID || "MLA",
+  meliSiteId: String(process.env.MELI_SITE_ID || "MLA").trim().toUpperCase(),
   meliAuthMode: String(process.env.MELI_AUTH_MODE || "standard").trim().toLowerCase(),
   allowedOrigins: (process.env.ALLOWED_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean),
   maxProductsPerRequest: Number(process.env.MAX_PRODUCTS_PER_JOB || 100),
@@ -63,19 +63,30 @@ const config = {
   requireApiPreflight: String(process.env.REQUIRE_API_PREFLIGHT || "true") === "true",
   catalogItemsPageSize: Math.max(1, Math.min(50, Number(process.env.MELI_CATALOG_ITEMS_PAGE_SIZE || 50))),
   maxCatalogItemPages: Math.max(1, Math.min(20, Number(process.env.MELI_MAX_CATALOG_ITEM_PAGES || 20))),
-  maxUpcAssociatedItems: Math.max(1, Math.min(1000, Number(process.env.MELI_MAX_UPC_ASSOCIATED_ITEMS || 1000))),
-  upcItemBatchSize: Math.max(1, Math.min(20, Number(process.env.MELI_UPC_ITEM_BATCH_SIZE || 20))),
-  maxUpcCatalogProducts: Math.max(1, Math.min(100, Number(process.env.MELI_MAX_UPC_CATALOG_PRODUCTS || 30))),
-  maxUpcCatalogDepth: Math.max(0, Math.min(5, Number(process.env.MELI_MAX_UPC_CATALOG_DEPTH || 3))),
-  maxUpcRelatedItems: Math.max(1, Math.min(200, Number(process.env.MELI_MAX_UPC_RELATED_ITEMS || 50))),
-  maxUpcUserProducts: Math.max(1, Math.min(200, Number(process.env.MELI_MAX_UPC_USER_PRODUCTS || 50))),
-  maxUpcWebPages: Math.max(0, Math.min(100, Number(process.env.MELI_MAX_UPC_WEB_PAGES || 20))),
-  upcAttemptLogBodyChars: Math.max(0, Math.min(4000, Number(process.env.MELI_UPC_ATTEMPT_LOG_BODY_CHARS || 800))),
   cacheSuccessfulResults: String(process.env.CACHE_SUCCESSFUL_RESULTS || "true") === "true",
-  logCatalogSamples: String(process.env.LOG_CATALOG_SAMPLES || "false") === "true",
   tokenRefreshLeadMs: Number(process.env.MELI_TOKEN_REFRESH_LEAD_MS || 1000 * 60 * 60),
   tokenCheckIntervalMs: Number(process.env.MELI_TOKEN_CHECK_INTERVAL_MS || 1000 * 60 * 10)
 };
+
+const marketSites = {
+  MLA: { sheet_name: "UPC_ARG", currency_id: "ARS", auth_base: "https://auth.mercadolibre.com.ar" },
+  MLM: { sheet_name: "UPC_MEX", currency_id: "MXN", auth_base: "https://auth.mercadolibre.com.mx" },
+  MCO: { sheet_name: "UPC_COL", currency_id: "COP", auth_base: "https://auth.mercadolibre.com.co" },
+  MLC: { sheet_name: "UPC_CHI", currency_id: "CLP", auth_base: "https://auth.mercadolibre.cl" },
+  MLB: { sheet_name: "UPC_BRA", currency_id: "BRL", auth_base: "https://auth.mercadolivre.com.br" }
+};
+
+function resolveMarket(data = {}) {
+  const sheetName = String(data.sheet_name || "").trim();
+  const fromSheet = Object.keys(marketSites).find(id => marketSites[id].sheet_name === sheetName);
+  const explicitSite = String(data.site_id || "").trim().toUpperCase();
+  const siteId = explicitSite || fromSheet || String(config.meliSiteId).trim().toUpperCase();
+  if (!marketSites[siteId]) throw apiError("País no soportado", { code: "invalid_site_id", status: 400 });
+  if (fromSheet && explicitSite && fromSheet !== explicitSite) {
+    throw apiError("El país no coincide con la pestaña", { code: "sheet_site_mismatch", status: 400 });
+  }
+  return { site_id: siteId, currency_id: marketSites[siteId].currency_id, sheet_name: sheetName || marketSites[siteId].sheet_name };
+}
 
 const jobs = new Map();
 const productCache = new Map();
@@ -140,6 +151,7 @@ app.use(rateLimit({
 const jobSchema = z.object({
   sheet_url: z.string().min(10).max(1000),
   sheet_name: z.string().min(1).max(100).optional().default(""),
+  site_id: z.enum(["MLA", "MLM", "MCO", "MLC", "MLB"]).optional(),
   email: z.string().email().optional().or(z.literal(""))
 });
 
@@ -153,6 +165,7 @@ const productSchema = z.object({
 const monitorSchema = z.object({
   job_id: z.string().min(8).max(100),
   products: z.array(productSchema).min(1),
+  site_id: z.enum(["MLA", "MLM", "MCO", "MLC", "MLB"]).optional(),
   total_products: z.union([z.string(), z.number()]).optional(),
   batch_index: z.union([z.string(), z.number()]).optional(),
   total_batches: z.union([z.string(), z.number()]).optional()
@@ -166,25 +179,10 @@ const callbackSchema = z.object({
 });
 
 const testProductSchema = z.object({
+  site_id: z.enum(["MLA", "MLM", "MCO", "MLC", "MLB"]).optional(),
   ean: z.union([z.string(), z.number()]),
   brand: z.string().optional().default(""),
   name: z.string().optional().default("")
-});
-
-const upcLookupProductSchema = z.object({
-  row_number: z.number().int().positive(),
-  mla: z.union([z.string(), z.number()])
-});
-
-const upcLookupSchema = z.object({
-  job_id: z.string().min(8).max(100).optional().default(""),
-  mlas: z.array(z.union([z.string(), z.number()])).max(100).optional().default([]),
-  products: z.array(upcLookupProductSchema).max(100).optional().default([]),
-  total_products: z.union([z.string(), z.number()]).optional(),
-  batch_index: z.union([z.string(), z.number()]).optional(),
-  total_batches: z.union([z.string(), z.number()]).optional()
-}).refine(data => data.mlas.length > 0 || data.products.length > 0, {
-  message: "Debe enviar mlas o products"
 });
 
 function nowIso() {
@@ -215,6 +213,8 @@ function publicJob(job) {
     status: job.status,
     sheet_url: job.sheet_url,
     sheet_name: job.sheet_name,
+    site_id: job.site_id,
+    currency_id: job.currency_id,
     total: job.total,
     processed: job.processed,
     ok: job.ok,
@@ -233,11 +233,14 @@ function publicJob(job) {
 }
 
 function createEmptyJob(data) {
+  const market = resolveMarket(data);
   return {
     job_id: data.job_id,
     job_type: data.job_type || "ean_to_mla",
     sheet_url: data.sheet_url || "",
     sheet_name: data.sheet_name || "",
+    site_id: market.site_id,
+    currency_id: market.currency_id,
     email: data.email || "",
     status: data.status || "pending",
     total: Number(data.total || 0),
@@ -257,7 +260,6 @@ function createEmptyJob(data) {
   };
 }
 
-
 function dateToIso(value) {
   if (!value) return null;
   if (value instanceof Date) return value.toISOString();
@@ -267,11 +269,14 @@ function dateToIso(value) {
 
 function jobFromRow(row) {
   if (!row) return null;
+  const market = resolveMarket({ sheet_name: row.sheet_name, site_id: row.site_id });
   return {
     job_id: row.job_id,
     job_type: row.job_type,
     sheet_url: row.sheet_url || "",
     sheet_name: row.sheet_name || "",
+    site_id: market.site_id,
+    currency_id: market.currency_id,
     email: row.email || "",
     status: row.status || "pending",
     total: Number(row.total || 0),
@@ -379,6 +384,9 @@ async function initializeDatabase() {
     )
   `);
 
+  await dbPool.query("ALTER TABLE meli_monitor_jobs ADD COLUMN IF NOT EXISTS site_id TEXT NOT NULL DEFAULT ''");
+  await dbPool.query("ALTER TABLE meli_monitor_jobs ADD COLUMN IF NOT EXISTS currency_id TEXT NOT NULL DEFAULT ''");
+
   databaseReady = true;
   return true;
 }
@@ -391,13 +399,15 @@ async function saveJob(job) {
       job_id, job_type, sheet_url, sheet_name, email, status, total,
       processed, ok_count, not_found, no_offers, api_errors, errors,
       updated_rows, total_batches, synced_batches, created_at, started_at,
-      finished_at, error, updated_at
+      finished_at, error, site_id, currency_id, updated_at
     ) VALUES (
       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-      COALESCE($17::timestamptz, NOW()),$18::timestamptz,$19::timestamptz,$20,NOW()
+      COALESCE($17::timestamptz, NOW()),$18::timestamptz,$19::timestamptz,$20,$21,$22,NOW()
     )
     ON CONFLICT (job_id) DO UPDATE SET
       job_type = EXCLUDED.job_type,
+      site_id = EXCLUDED.site_id,
+      currency_id = EXCLUDED.currency_id,
       sheet_url = CASE WHEN EXCLUDED.sheet_url <> '' THEN EXCLUDED.sheet_url ELSE meli_monitor_jobs.sheet_url END,
       sheet_name = CASE WHEN EXCLUDED.sheet_name <> '' THEN EXCLUDED.sheet_name ELSE meli_monitor_jobs.sheet_name END,
       email = CASE WHEN EXCLUDED.email <> '' THEN EXCLUDED.email ELSE meli_monitor_jobs.email END,
@@ -436,7 +446,9 @@ async function saveJob(job) {
     job.created_at || null,
     job.started_at || null,
     job.finished_at || null,
-    job.error || ""
+    job.error || "",
+    job.site_id,
+    job.currency_id
   ]);
 }
 
@@ -481,13 +493,14 @@ function retryDelayMs(attempt) {
   return exponential + jitter;
 }
 
-async function ensurePersistentJobForBatch(jobId, jobType, totalProducts, totalBatches) {
+async function ensurePersistentJobForBatch(jobId, jobType, totalProducts, totalBatches, siteId) {
   let job = await getPersistentJob(jobId);
 
   if (!job) {
     job = createEmptyJob({
       job_id: jobId,
       job_type: jobType,
+      site_id: siteId,
       status: "queued",
       total: totalProducts,
       total_batches: totalBatches
@@ -496,6 +509,10 @@ async function ensurePersistentJobForBatch(jobId, jobType, totalProducts, totalB
     await saveJob(job);
     jobs.set(job.job_id, job);
     return job;
+  }
+
+  if (job.job_type !== jobType || job.site_id !== siteId) {
+    throw apiError("La tanda no coincide con el trabajo", { code: "job_site_conflict", status: 409 });
   }
 
   const updated = await dbPool.query(`
@@ -537,7 +554,10 @@ async function enqueuePersistentBatch({ jobId, jobType, batchIndex, totalBatches
     throw apiError("total_batches inválido", { code: "invalid_total_batches", status: 400 });
   }
 
-  const job = await ensurePersistentJobForBatch(jobId, jobType, totalProducts, totalBatches);
+  const existingJob = await getPersistentJob(jobId);
+  const market = resolveMarket({ sheet_name: existingJob?.sheet_name, site_id: payload.site_id || existingJob?.site_id });
+  payload = { ...payload, site_id: market.site_id };
+  const job = await ensurePersistentJobForBatch(jobId, jobType, totalProducts, totalBatches, market.site_id);
   const hash = payloadHash(payload);
   const batchId = `batch_${jobId}_${batchIndex}_${uuidv4().replace(/-/g, "").slice(0, 8)}`;
 
@@ -642,22 +662,6 @@ function startBatchLeaseHeartbeat(batchId) {
   return () => clearInterval(timer);
 }
 
-function buildUpcBatchSummary(results, requested) {
-  const apiErrors = results.filter(result => String(result.status || "").startsWith("api_")).length;
-  return {
-    requested,
-    processed: results.length,
-    found: results.filter(result => result.status === "ok").length,
-    without_identifier: results.filter(result => ["identifier_not_available", "identifier_candidates", "partial_scan"].includes(result.status)).length,
-    with_candidates: results.filter(result => result.status === "identifier_candidates").length,
-    partial_scans: results.filter(result => result.status === "partial_scan").length,
-    invalid: results.filter(result => result.status === "invalid_mla").length,
-    not_found: results.filter(result => result.status === "item_not_found").length,
-    api_errors: apiErrors,
-    errors: results.filter(result => !["ok", "identifier_not_available", "identifier_candidates", "partial_scan", "invalid_mla", "item_not_found"].includes(result.status)).length
-  };
-}
-
 async function processQueuedBatch(batch) {
   const stopHeartbeat = startBatchLeaseHeartbeat(batch.batch_id);
   try {
@@ -670,41 +674,16 @@ async function processQueuedBatch(batch) {
       });
     }
 
+    if (batch.job_type !== "ean_to_mla") {
+      throw apiError("Tipo de trabajo no soportado", { code: "unsupported_job_type", status: 400 });
+    }
     const payload = batch.payload || {};
+    const job = await getPersistentJob(batch.job_id);
+    const market = resolveMarket({ sheet_name: job?.sheet_name, site_id: payload.site_id || job?.site_id });
     const inputs = Array.isArray(payload.products) ? payload.products : [];
-    let results;
-    let summary;
-
-    if (batch.job_type === "mla_to_upc") {
-      results = await mapWithConcurrency(inputs, config.productConcurrency, async entry => {
+    const results = await mapWithConcurrency(inputs, config.productConcurrency, async row => {
         try {
-          return await resolveUpcsByMla(entry);
-        } catch (error) {
-          const rawMla = entry && typeof entry === "object" ? entry.mla : entry;
-          return {
-            row_number: entry && typeof entry === "object" ? entry.row_number || null : null,
-            input: String(rawMla || ""),
-            mla: normalizeMlaId(rawMla),
-            title: "",
-            catalog_product_id: null,
-            primary_identifier: null,
-            upc: null,
-            upcs: [],
-            gtins: [],
-            candidate_upcs: [],
-            candidate_gtins: [],
-            identifiers: [],
-            status: "unexpected_error",
-            error: String(error.message || error).slice(0, 1000),
-            checked_at: nowIso()
-          };
-        }
-      });
-      summary = buildUpcBatchSummary(results, inputs.length);
-    } else {
-      results = await mapWithConcurrency(inputs, config.productConcurrency, async row => {
-        try {
-          return await resolveProduct(row);
+          return await resolveProduct(row, market.site_id);
         } catch (error) {
           const ean = normalizeEan(row.ean);
           logger.error({
@@ -717,8 +696,7 @@ async function processQueuedBatch(batch) {
           return resultError(row, ean, "unexpected_error", error.message);
         }
       });
-      summary = countBatchResults(results);
-    }
+    const summary = countBatchResults(results);
 
     await dbPool.query(`
       UPDATE meli_monitor_batches
@@ -833,6 +811,8 @@ async function deliverBatchCallback(batch) {
       total_products: Number(batch.total_products),
       sheet_url: job.sheet_url,
       sheet_name: job.sheet_name,
+    site_id: job.site_id,
+    currency_id: job.currency_id,
       batch_summary: batch.summary || {},
       results: Array.isArray(batch.results) ? batch.results : [],
       processed_at: dateToIso(batch.processed_at)
@@ -928,13 +908,6 @@ async function refreshJobAggregates(jobId) {
     if (row.status === "synced") syncedBatches += 1;
     if (["failed", "callback_failed"].includes(row.status)) failedBatches += 1;
 
-    if (current.job_type === "mla_to_upc") {
-      ok += Number(summary.found || 0);
-      notFound += Number(summary.not_found || 0);
-      noOffers += Number(summary.without_identifier || 0);
-      apiErrors += Number(summary.api_errors || 0);
-      errors += Number(summary.errors || 0);
-    } else {
       ok += Number(summary.ok || 0);
       notFound += Number(summary.product_not_found || 0);
       noOffers += Number(summary.offers_not_found || 0) + Number(summary.catalog_only || 0);
@@ -945,7 +918,6 @@ async function refreshJobAggregates(jobId) {
         + Number(summary.invalid_ean || 0)
         + Number(summary.api_errors || 0)
         + Number(summary.other_errors || 0);
-    }
   }
 
   const totalBatches = Math.max(
@@ -1110,8 +1082,7 @@ function requireWpOrN8n(req, res, next) {
 
 function getMeliAuthBase() {
   if (config.meliAuthMode === "global_selling") return "https://global-selling.mercadolibre.com";
-  if (config.meliSiteId === "MLB") return "https://auth.mercadolivre.com.br";
-  return "https://auth.mercadolibre.com.ar";
+  return marketSites[config.meliSiteId]?.auth_base || marketSites.MLA.auth_base;
 }
 
 function hasMeliCredentials() {
@@ -1582,7 +1553,7 @@ function parsePrice(value) {
 
 function normalizeCatalogId(value) {
   const text = String(value || "");
-  const match = text.match(/ML[A-Z]?\d{5,}/i);
+  const match = text.match(/(?:MLA|MLM|MLB|MLC|MCO|MPE|MLU)\d{5,}/i);
   return match ? match[0].toUpperCase() : "";
 }
 
@@ -1590,131 +1561,6 @@ function normalizeItemId(value) {
   const text = String(value || "");
   const match = text.match(/MLA\d{5,}|MLB\d{5,}|MLM\d{5,}|MLC\d{5,}|MCO\d{5,}|MPE\d{5,}|MLU\d{5,}/i);
   return match ? match[0].toUpperCase() : "";
-}
-
-function normalizeMlaId(value) {
-  const text = String(value || "").trim().toUpperCase();
-  const match = text.match(/MLA[-\s]?(\d{5,})/);
-  if (match) return `MLA${match[1]}`;
-  if (/^\d{5,}$/.test(text)) return `MLA${text}`;
-  return "";
-}
-
-function classifyProductIdentifier(value) {
-  if (value.length === 8) return "GTIN-8";
-  if (value.length === 12) return "UPC";
-  if (value.length === 13) return "EAN";
-  if (value.length === 14) return "GTIN-14";
-  return "GTIN";
-}
-
-function isValidProductIdentifier(value) {
-  const normalized = normalizeEan(value);
-  if (![8, 12, 13, 14].includes(normalized.length)) return false;
-
-  const digits = normalized.split("").map(Number);
-  const expectedCheckDigit = digits.pop();
-  let sum = 0;
-  let positionFromRight = 1;
-
-  for (let index = digits.length - 1; index >= 0; index -= 1) {
-    sum += digits[index] * (positionFromRight % 2 === 1 ? 3 : 1);
-    positionFromRight += 1;
-  }
-
-  return (10 - (sum % 10)) % 10 === expectedCheckDigit;
-}
-
-function extractProductIdentifiers(payload, source) {
-  const found = new Map();
-  const visited = new Set();
-  const acceptedIds = new Set([
-    "GTIN",
-    "GTIN8",
-    "GTIN_8",
-    "GTIN12",
-    "GTIN_12",
-    "GTIN13",
-    "GTIN_13",
-    "GTIN14",
-    "GTIN_14",
-    "UPC",
-    "UPC_A",
-    "EAN",
-    "EAN8",
-    "EAN_8",
-    "EAN13",
-    "EAN_13",
-    "JAN"
-  ]);
-
-  function addValue(rawValue, attributeId) {
-    const value = normalizeEan(rawValue);
-    if (!isValidProductIdentifier(value)) return;
-    const key = `${attributeId}:${value}`;
-    if (!found.has(key)) {
-      found.set(key, {
-        type: classifyProductIdentifier(value),
-        attribute_id: attributeId,
-        value,
-        source
-      });
-    }
-  }
-
-  function visit(value, depth) {
-    if (!value || typeof value !== "object" || depth > 8 || visited.has(value)) return;
-    visited.add(value);
-
-    if (!Array.isArray(value)) {
-      for (const [key, child] of Object.entries(value)) {
-        const directId = String(key).toUpperCase();
-        if (acceptedIds.has(directId) && (typeof child === "string" || typeof child === "number")) {
-          addValue(child, directId);
-        }
-      }
-
-      const attributeId = firstString(value.id, value.attribute_id, value.attributeId).toUpperCase();
-      const attributeName = firstString(value.name, value.attribute_name, value.attributeName).toUpperCase();
-      const identifierId = acceptedIds.has(attributeId)
-        ? attributeId
-        : acceptedIds.has(attributeName)
-          ? attributeName
-          : "";
-
-      if (identifierId) {
-        addValue(value.value_name, identifierId);
-        addValue(value.value, identifierId);
-        if (Array.isArray(value.values)) {
-          for (const entry of value.values) {
-            if (entry && typeof entry === "object") {
-              addValue(entry.name, identifierId);
-              addValue(entry.value_name, identifierId);
-              addValue(entry.value, identifierId);
-            } else {
-              addValue(entry, identifierId);
-            }
-          }
-        }
-      }
-    }
-
-    for (const child of Object.values(value)) {
-      if (child && typeof child === "object") visit(child, depth + 1);
-    }
-  }
-
-  visit(payload, 0);
-
-  const byValue = new Map();
-  for (const identifier of found.values()) {
-    const existing = byValue.get(identifier.value);
-    if (!existing || identifier.attribute_id === "UPC") {
-      byValue.set(identifier.value, identifier);
-    }
-  }
-
-  return [...byValue.values()];
 }
 
 function getPath(object, path) {
@@ -1776,12 +1622,6 @@ function normalizeCurrency(value) {
   return firstString(value).toUpperCase();
 }
 
-function normalizeSold(value) {
-  const number = firstNumber(value);
-  if (number === null || number < 0) return null;
-  return Math.trunc(number);
-}
-
 function normalizeCatalogProduct(raw) {
   if (!raw || typeof raw !== "object") return null;
 
@@ -1839,20 +1679,6 @@ function normalizeCatalogOffer(raw, catalogProductId, source) {
     ? deepFindValue(raw, ["current_price", "sale_price", "display_amount", "price"], 4)
     : undefined;
 
-  const soldValue = firstPath(raw, [
-    "sold_quantity",
-    "soldQuantity",
-    "sold",
-    "sales.quantity",
-    "sales.sold_quantity",
-    "item.sold_quantity",
-    "offer.sold_quantity"
-  ]);
-
-  const deepSoldValue = soldValue === undefined
-    ? deepFindValue(raw, ["sold_quantity", "soldQuantity"], 4)
-    : undefined;
-
   const status = normalizeStatus(firstPath(raw, [
     "status",
     "item.status",
@@ -1881,8 +1707,6 @@ function normalizeCatalogOffer(raw, catalogProductId, source) {
 
   if (!itemId) return null;
 
-  const sold = normalizeSold(soldValue === undefined ? deepSoldValue : soldValue);
-
   return {
     item_id: itemId,
     catalog_product_id: catalogProductId || normalizeCatalogId(raw.catalog_product_id) || null,
@@ -1890,44 +1714,10 @@ function normalizeCatalogOffer(raw, catalogProductId, source) {
     currency_id: currency || null,
     status: status || null,
     link: link || null,
-    sold,
-    sold_source: sold !== null ? "catalog_items_api" : "not_available",
+
     source,
     raw
   };
-}
-
-function summarizeRawOffer(raw) {
-  if (!raw || typeof raw !== "object") return null;
-  const summary = {
-    keys: Object.keys(raw).slice(0, 30)
-  };
-  const candidates = [
-    "id",
-    "item_id",
-    "itemId",
-    "price",
-    "amount",
-    "current_price",
-    "sale_price",
-    "sold_quantity",
-    "status",
-    "currency_id",
-    "permalink"
-  ];
-  for (const key of candidates) {
-    if (raw[key] !== undefined) summary[key] = raw[key];
-  }
-  if (raw.item && typeof raw.item === "object") {
-    summary.item_keys = Object.keys(raw.item).slice(0, 20);
-  }
-  if (raw.price && typeof raw.price === "object") {
-    summary.price_keys = Object.keys(raw.price).slice(0, 20);
-  }
-  if (raw.sale_price && typeof raw.sale_price === "object") {
-    summary.sale_price_keys = Object.keys(raw.sale_price).slice(0, 20);
-  }
-  return summary;
 }
 
 function extractPaging(data, fallbackOffset, fallbackLimit, received) {
@@ -1956,8 +1746,7 @@ function resultError(row, ean, status, error, details = {}) {
     min_price: null,
     link: details.link || details.item_id || null,
     mla: details.item_id || null,
-    sold: null,
-    sold_source: "not_available",
+
     source: details.source || "mercadolibre_api",
     status,
     error: error ? String(error).slice(0, 500) : "",
@@ -1978,9 +1767,7 @@ function buildResolvedResult(row, ean, data) {
     min_price: data.min_price === undefined ? null : data.min_price,
     link: data.link || data.item_id || null,
     mla: data.item_id || null,
-    sold: null,
-    sold_source: "not_available",
-    sold_start_time: null,
+
     source: data.source || "mercadolibre_api",
     status: "ok",
     error: "",
@@ -2002,11 +1789,10 @@ function buildCatalogOnlyResult(row, ean, data) {
     min_price: null,
     link: data.item_id || null,
     mla: data.item_id || null,
-    sold: data.sold === undefined ? null : data.sold,
-    sold_source: data.sold_source || "not_available",
+
     source: data.source || "catalog_items_api",
     status: "catalog_only",
-    error: "MercadoLibre informó publicaciones MLA asociadas, pero no expuso un precio utilizable",
+    error: "MercadoLibre informó publicaciones asociadas, pero no expuso un precio utilizable",
     api_http_status: 200,
     api_endpoint: data.api_endpoint || null,
     retryable: false,
@@ -2015,14 +1801,14 @@ function buildCatalogOnlyResult(row, ean, data) {
   };
 }
 
-async function searchProductsByEan(ean) {
+async function searchProductsByEan(ean, siteId) {
   const errors = [];
   const exactPath = "/products/search";
 
   try {
     const data = await meliRequest(exactPath, {
       params: {
-        site_id: config.meliSiteId,
+        site_id: siteId,
         product_identifier: ean,
         status: "active"
       },
@@ -2132,24 +1918,6 @@ async function fetchCatalogOffers(catalogProductId) {
     }
   }
 
-  if (config.logCatalogSamples && rawOffers.length) {
-    logger.info({
-      catalog_product_id: catalogProductId,
-      endpoint: path,
-      paginas_leidas: pagesRead,
-      publicaciones_unicas: normalizedOffers.length,
-      muestra_estructura: rawOffers.slice(0, 3).map(summarizeRawOffer),
-      muestra_normalizada: normalizedOffers.slice(0, 5).map(offer => ({
-        item_id: offer.item_id,
-        price: offer.price,
-        currency_id: offer.currency_id,
-        status: offer.status,
-        sold: offer.sold,
-        link_presente: Boolean(offer.link)
-      }))
-    }, "Diagnóstico de la respuesta de publicaciones del producto de catálogo");
-  }
-
   return {
     offers: normalizedOffers,
     raw_offers: rawOffers,
@@ -2166,22 +1934,20 @@ function isOfferActive(offer) {
   return ["active", "under_review"].includes(offer.status);
 }
 
-function isOfferCurrencyAllowed(offer) {
+function isOfferCurrencyAllowed(offer, siteId) {
   if (!offer.currency_id) return true;
-  return offer.currency_id === "ARS";
+  return offer.currency_id === marketSites[siteId].currency_id;
 }
 
-function pickBestOffer(offers) {
+function pickBestOffer(offers, siteId) {
   return (offers || [])
     .filter(offer => isOfferActive(offer))
-    .filter(offer => isOfferCurrencyAllowed(offer))
+    .filter(offer => isOfferCurrencyAllowed(offer, siteId))
     .filter(offer => offer.price !== null && offer.price !== undefined && Number(offer.price) > 0)
     .sort((a, b) => {
       const priceDifference = Number(a.price) - Number(b.price);
       if (priceDifference !== 0) return priceDifference;
-      const aSold = a.sold === null ? -1 : Number(a.sold);
-      const bSold = b.sold === null ? -1 : Number(b.sold);
-      return bSold - aSold;
+      return 0;
     })[0] || null;
 }
 
@@ -2207,14 +1973,16 @@ function logApiDiagnostic(payload, message) {
   }, message);
 }
 
-async function resolveProduct(row) {
+async function resolveProduct(row, siteId = config.meliSiteId) {
+  const market = resolveMarket({ site_id: siteId });
+  siteId = market.site_id;
   const ean = normalizeEan(row.ean);
 
   if (!isValidEan(ean)) {
     return resultError(row, ean, "invalid_ean", "EAN inválido");
   }
 
-  const cacheKey = `api-v5-price-only:${config.meliSiteId}:ean:${ean}`;
+  const cacheKey = `api-v6-price-only:${siteId}:ean:${ean}`;
   const cached = cacheGet(cacheKey);
 
   if (cached) {
@@ -2235,7 +2003,7 @@ async function resolveProduct(row) {
   let productSearch;
 
   try {
-    productSearch = await searchProductsByEan(ean);
+    productSearch = await searchProductsByEan(ean, siteId);
   } catch (error) {
     return resultError(row, ean, error.code || "api_error", error.message, {
       api_http_status: error.status,
@@ -2290,25 +2058,9 @@ async function resolveProduct(row) {
   const offers = catalogResult.offers;
   const offersEndpoint = catalogResult.endpoint;
 
-  const best = pickBestOffer(offers);
+  const best = pickBestOffer(offers, siteId);
   const itemCandidates = offers.filter(offer => offer.item_id);
   const firstItem = itemCandidates[0] || null;
-
-  logger.info({
-    row_number: row.row_number,
-    ean,
-    catalog_product_id: catalogProductId,
-    publicaciones_catalogo: catalogResult.offers.length,
-    publicaciones_unicas: offers.length,
-    publicaciones_activas: offers.filter(isOfferActive).length,
-    publicaciones_con_precio: offers.filter(offer => offer.price !== null && offer.price !== undefined && Number(offer.price) > 0).length,
-    publicaciones_con_vendidos: offers.filter(offer => offer.sold !== null && offer.sold !== undefined).length,
-    monedas: [...new Set(offers.map(offer => offer.currency_id).filter(Boolean))],
-    endpoint_seleccionado: offersEndpoint,
-    mejor_item_id: best?.item_id || null,
-    menor_precio: best?.price ?? null,
-    vendidos_mejor_oferta: best?.sold ?? null
-  }, "Finalizó la evaluación de publicaciones para calcular el menor precio");
 
   if (best) {
     const result = buildResolvedResult(row, ean, {
@@ -2320,16 +2072,7 @@ async function resolveProduct(row) {
       api_endpoint: offersEndpoint
     });
 
-    logger.info({
-      row_number: row.row_number,
-      ean,
-      catalog_product_id: catalogProductId,
-      item_id: result.item_id,
-      meli_price: result.min_price,
-      status: result.status,
-      source: result.source,
-      api_endpoint: result.api_endpoint
-    }, "Producto resuelto con la publicación de menor precio disponible");
+    logger.debug({ ean, site_id: siteId, item_id: result.item_id, min_price: result.min_price }, "Producto resuelto");
 
     if (config.cacheSuccessfulResults) cacheSet(cacheKey, result);
     return result;
@@ -2360,1248 +2103,24 @@ async function resolveProduct(row) {
         price: offer.price,
         currency_id: offer.currency_id,
         status: offer.status,
-        sold: offer.sold,
+
         source: offer.source
       }))
-    }, "MercadoLibre informó MLA asociados, pero no expuso un precio utilizable");
+    }, "MercadoLibre informó publicaciones asociadas, pero no expuso un precio utilizable");
 
     return buildCatalogOnlyResult(row, ean, {
       catalog_product_id: catalogProductId,
       item_id: firstItem.item_id,
-      sold: firstItem.sold,
-      sold_source: firstItem.sold_source,
+
       source: firstItem.source,
       api_endpoint: offersEndpoint
     });
   }
 
-  return resultError(row, ean, "offers_not_found", "MercadoLibre reconoció el producto, pero no informó publicaciones MLA asociadas", {
+  return resultError(row, ean, "offers_not_found", "MercadoLibre reconoció el producto, pero no informó publicaciones asociadas", {
     catalog_product_id: catalogProductId,
     api_endpoint: offersEndpoint
   });
-}
-
-function mergeIdentifierEvidence(store, identifiers, context = {}) {
-  for (const identifier of identifiers) {
-    const value = normalizeEan(identifier.value);
-    if (!isValidProductIdentifier(value)) continue;
-
-    let evidence = store.get(value);
-
-    if (!evidence) {
-      evidence = {
-        value,
-        type: classifyProductIdentifier(value),
-        attribute_ids: new Set(),
-        sources: new Set(),
-        item_ids: new Set(),
-        catalog_product_ids: new Set(),
-        catalog_direct: false,
-        catalog_tree_direct: false,
-        verified: false,
-        verification_status: "pending",
-        reverse_catalog_product_ids: new Set()
-      };
-      store.set(value, evidence);
-    }
-
-    if (identifier.attribute_id) evidence.attribute_ids.add(String(identifier.attribute_id));
-    if (identifier.source) evidence.sources.add(String(identifier.source));
-    if (context.source) evidence.sources.add(String(context.source));
-    if (context.item_id) evidence.item_ids.add(String(context.item_id));
-    if (context.catalog_product_id) evidence.catalog_product_ids.add(String(context.catalog_product_id));
-    if (context.catalog_direct) evidence.catalog_direct = true;
-    if (context.catalog_tree_direct) evidence.catalog_tree_direct = true;
-  }
-}
-
-async function fetchAssociatedItemDetails(itemIds) {
-  const uniqueItemIds = [...new Set(itemIds.map(normalizeItemId).filter(Boolean))];
-  const limitedItemIds = uniqueItemIds.slice(0, config.maxUpcAssociatedItems);
-  const detailsById = new Map();
-  const errors = [];
-
-  for (let index = 0; index < limitedItemIds.length; index += config.upcItemBatchSize) {
-    const batch = limitedItemIds.slice(index, index + config.upcItemBatchSize);
-
-    try {
-      const data = await meliRequest("/items", {
-        params: {
-          ids: batch.join(","),
-          include_internal_attributes: true
-        },
-        operation: "buscar_atributos_de_publicaciones_asociadas",
-        maxRetries: 1
-      });
-
-      const responses = Array.isArray(data) ? data : [data];
-
-      for (const response of responses) {
-        const status = Number(response?.code || response?.status || 200);
-        const body = response?.body && typeof response.body === "object" ? response.body : response;
-        const itemId = normalizeItemId(firstString(body?.id, body?.item_id));
-        if (status >= 200 && status < 300 && itemId) detailsById.set(itemId, body);
-      }
-    } catch (error) {
-      logger.warn({
-        item_ids: batch,
-        codigo: error.code || "api_error",
-        estado_http: error.status || null
-      }, "Falló la consulta múltiple de publicaciones asociadas");
-    }
-
-    const missingItemIds = batch.filter(itemId => !detailsById.has(itemId));
-
-    const fallbackResults = await mapWithConcurrency(missingItemIds, config.productConcurrency, async itemId => {
-      try {
-        const data = await meliRequest(`/items/${itemId}`, {
-          params: {
-            include_internal_attributes: true
-          },
-          operation: "buscar_atributos_de_publicacion_asociada",
-          maxRetries: 1
-        });
-        return { item_id: itemId, data, error: null };
-      } catch (error) {
-        return { item_id: itemId, data: null, error };
-      }
-    });
-
-    for (const result of fallbackResults) {
-      if (result.data) {
-        detailsById.set(result.item_id, result.data);
-      } else if (result.error) {
-        errors.push({
-          item_id: result.item_id,
-          code: result.error.code || "api_error",
-          status: result.error.status || null,
-          message: result.error.message
-        });
-      }
-    }
-  }
-
-  return {
-    details: [...detailsById.entries()].map(([item_id, data]) => ({ item_id, data })),
-    errors,
-    requested: limitedItemIds.length,
-    available: detailsById.size,
-    truncated: limitedItemIds.length < uniqueItemIds.length
-  };
-}
-
-async function verifyIdentifierEvidence(catalogProductId, evidenceList) {
-  return mapWithConcurrency(evidenceList, config.productConcurrency, async evidence => {
-    if (evidence.catalog_direct) {
-      evidence.verified = true;
-      evidence.verification_status = "catalog_direct";
-      evidence.reverse_catalog_product_ids.add(catalogProductId);
-      return evidence;
-    }
-
-    try {
-      const lookup = await searchProductsByEan(evidence.value);
-      const reverseIds = lookup.results.map(result => result.catalog_product_id).filter(Boolean);
-      for (const reverseId of reverseIds) evidence.reverse_catalog_product_ids.add(reverseId);
-
-      if (reverseIds.includes(catalogProductId)) {
-        evidence.verified = true;
-        evidence.verification_status = "reverse_match";
-      } else if (reverseIds.length) {
-        evidence.verification_status = "reverse_other_catalog";
-      } else if (lookup.errors.length) {
-        evidence.verification_status = "reverse_api_error";
-      } else {
-        evidence.verification_status = "reverse_no_match";
-      }
-    } catch (error) {
-      evidence.verification_status = "reverse_api_error";
-    }
-
-    return evidence;
-  });
-}
-
-function serializeIdentifierEvidence(evidence) {
-  return {
-    value: evidence.value,
-    type: evidence.type,
-    verified: evidence.verified,
-    verification_status: evidence.verification_status,
-    attribute_ids: [...evidence.attribute_ids],
-    sources: [...evidence.sources],
-    item_ids: [...evidence.item_ids],
-    catalog_product_ids: [...evidence.catalog_product_ids],
-    reverse_catalog_product_ids: [...evidence.reverse_catalog_product_ids]
-  };
-}
-
-function responseFingerprint(data) {
-  try {
-    return crypto.createHash("sha1").update(JSON.stringify(data)).digest("hex");
-  } catch (error) {
-    return "";
-  }
-}
-
-function safeAttemptPreview(data) {
-  if (!config.upcAttemptLogBodyChars) return "";
-  try {
-    return JSON.stringify(data).slice(0, config.upcAttemptLogBodyChars);
-  } catch (error) {
-    return String(data || "").slice(0, config.upcAttemptLogBodyChars);
-  }
-}
-
-function countPayloadArrays(payload) {
-  const visited = new Set();
-  let attributes = 0;
-  let variations = 0;
-  let pictures = 0;
-
-  function visit(value, depth) {
-    if (!value || typeof value !== "object" || visited.has(value) || depth > 8) return;
-    visited.add(value);
-    if (Array.isArray(value.attributes)) attributes += value.attributes.length;
-    if (Array.isArray(value.variations)) variations += value.variations.length;
-    if (Array.isArray(value.pictures)) pictures += value.pictures.length;
-    for (const child of Object.values(value)) {
-      if (child && typeof child === "object") visit(child, depth + 1);
-    }
-  }
-
-  visit(payload, 0);
-  return { attributes, variations, pictures };
-}
-
-function summarizeAttemptParams(params) {
-  const summary = {};
-  if (!params || typeof params !== "object") return summary;
-  if (params.ids) summary.ids_count = String(params.ids).split(",").filter(Boolean).length;
-  if (params.attributes) summary.attributes = String(params.attributes);
-  if (params.include_internal_attributes !== undefined) {
-    summary.include_internal_attributes = Boolean(params.include_internal_attributes);
-  }
-  if (params.limit !== undefined) summary.limit = params.limit;
-  if (params.offset !== undefined) summary.offset = params.offset;
-  if (params.catalog_product_id) summary.catalog_product_id = params.catalog_product_id;
-  if (params.product_identifier) summary.product_identifier = params.product_identifier;
-  if (params.site_id) summary.site_id = params.site_id;
-  return summary;
-}
-
-function recordIdentifierAttempt(attempts, record) {
-  attempts.push(record);
-  logger.info({
-    catalog_product_id: record.catalog_product_id || null,
-    item_id: record.item_id || null,
-    user_product_id: record.user_product_id || null,
-    family_id: record.family_id || null,
-    attempt_id: record.attempt_id,
-    source: record.source,
-    endpoint: record.endpoint,
-    authentication: record.authentication,
-    parameters: record.parameters,
-    http_status: record.http_status,
-    inner_status: record.inner_status || null,
-    duration_ms: record.duration_ms,
-    response_keys: record.response_keys || [],
-    attributes_count: record.attributes_count || 0,
-    variations_count: record.variations_count || 0,
-    pictures_count: record.pictures_count || 0,
-    identifiers_found: record.identifiers_found || [],
-    response_fingerprint: record.response_fingerprint || "",
-    response_duplicate_of: record.response_duplicate_of || null,
-    api_error: record.api_error || null,
-    response_preview: record.response_preview || "",
-    continued: record.continued !== false
-  }, "Finalizó un camino del rastreo exhaustivo de identificadores");
-}
-
-async function executeMeliIdentifierAttempt(spec, attempts, fingerprints) {
-  const startedAt = Date.now();
-  const authentication = spec.auth === false ? "public" : "bearer";
-
-  try {
-    const data = await meliRequest(spec.endpoint, {
-      params: spec.params || {},
-      auth: spec.auth !== false,
-      operation: `rastrear_identificador_${spec.attemptId}`,
-      maxRetries: spec.maxRetries === undefined ? 1 : spec.maxRetries
-    });
-    const identifiers = extractProductIdentifiers(data, spec.source);
-    const fingerprint = responseFingerprint(data);
-    const duplicateOf = fingerprint && fingerprints.has(fingerprint) ? fingerprints.get(fingerprint) : null;
-    if (fingerprint && !duplicateOf) fingerprints.set(fingerprint, spec.attemptId);
-    const counts = countPayloadArrays(data);
-    const record = {
-      attempt_id: spec.attemptId,
-      source: spec.source,
-      endpoint: spec.endpoint,
-      authentication,
-      parameters: summarizeAttemptParams(spec.params),
-      catalog_product_id: spec.catalogProductId || null,
-      item_id: spec.itemId || null,
-      user_product_id: spec.userProductId || null,
-      family_id: spec.familyId || null,
-      http_status: 200,
-      duration_ms: Date.now() - startedAt,
-      response_keys: data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data).slice(0, 40) : [],
-      attributes_count: counts.attributes,
-      variations_count: counts.variations,
-      pictures_count: counts.pictures,
-      identifiers_found: identifiers.map(identifier => identifier.value),
-      response_fingerprint: fingerprint,
-      response_duplicate_of: duplicateOf,
-      continued: true
-    };
-    recordIdentifierAttempt(attempts, record);
-    return { ok: true, data, identifiers, status: 200, record };
-  } catch (error) {
-    const record = {
-      attempt_id: spec.attemptId,
-      source: spec.source,
-      endpoint: spec.endpoint,
-      authentication,
-      parameters: summarizeAttemptParams(spec.params),
-      catalog_product_id: spec.catalogProductId || null,
-      item_id: spec.itemId || null,
-      user_product_id: spec.userProductId || null,
-      family_id: spec.familyId || null,
-      http_status: error.status || 0,
-      duration_ms: Date.now() - startedAt,
-      identifiers_found: [],
-      api_error: error.code || "api_error",
-      response_preview: safeAttemptPreview(error.data || error.message),
-      continued: true
-    };
-    recordIdentifierAttempt(attempts, record);
-    return { ok: false, data: null, identifiers: [], status: error.status || 0, error, record };
-  }
-}
-
-function normalizeUserProductId(value) {
-  const text = String(value || "").trim().toUpperCase();
-  const match = text.match(/(?:ML[A-Z]U|CBTU|U)\d{3,}/);
-  return match ? match[0] : "";
-}
-
-function extractReferenceValues(payload) {
-  const catalogProductIds = new Set();
-  const childCatalogProductIds = new Set();
-  const itemIds = new Set();
-  const parentItemIds = new Set();
-  const userProductIds = new Set();
-  const familyIds = new Set();
-  const permalinks = new Set();
-  const imageUrls = new Set();
-  const visited = new Set();
-
-  function addCatalog(value, child = false) {
-    const id = normalizeCatalogId(value);
-    if (!id) return;
-    catalogProductIds.add(id);
-    if (child) childCatalogProductIds.add(id);
-  }
-
-  function addItem(value, parent = false) {
-    const id = normalizeItemId(value);
-    if (!id) return;
-    itemIds.add(id);
-    if (parent) parentItemIds.add(id);
-  }
-
-  function visit(value, depth) {
-    if (!value || typeof value !== "object" || visited.has(value) || depth > 10) return;
-    visited.add(value);
-
-    if (!Array.isArray(value)) {
-      for (const [rawKey, child] of Object.entries(value)) {
-        const key = String(rawKey).toLowerCase();
-        if (["catalog_product_id", "catalogproductid", "product_id"].includes(key)) addCatalog(child);
-        if (["children_ids", "child_product_ids"].includes(key) && Array.isArray(child)) {
-          for (const entry of child) addCatalog(entry, true);
-        }
-        if (["item_id", "itemid"].includes(key)) addItem(child);
-        if (key === "parent_item_id") addItem(child, true);
-        if (["user_product_id", "userproductid"].includes(key)) {
-          const id = normalizeUserProductId(child);
-          if (id) userProductIds.add(id);
-        }
-        if (key === "family_id" && child !== null && child !== undefined && String(child).trim()) {
-          familyIds.add(String(child).trim());
-        }
-        if (typeof child === "string" && /^https?:\/\//i.test(child)) {
-          const looksLikeImage = /\.(?:jpe?g|png|webp|gif)(?:\?|$)/i.test(child) || /mlstatic\.com/i.test(child);
-          if (["secure_url", "secureurl", "image", "image_url", "thumbnail"].includes(key) || (key === "url" && looksLikeImage)) {
-            imageUrls.add(child);
-          } else if (["permalink", "canonical_url"].includes(key) || (key === "url" && !looksLikeImage)) {
-            permalinks.add(child);
-          }
-        }
-      }
-    }
-
-    for (const child of Object.values(value)) {
-      if (child && typeof child === "object") visit(child, depth + 1);
-    }
-  }
-
-  visit(payload, 0);
-  return {
-    catalogProductIds: [...catalogProductIds],
-    childCatalogProductIds: [...childCatalogProductIds],
-    itemIds: [...itemIds],
-    parentItemIds: [...parentItemIds],
-    userProductIds: [...userProductIds],
-    familyIds: [...familyIds],
-    permalinks: [...permalinks],
-    imageUrls: [...imageUrls]
-  };
-}
-
-function extractLabeledIdentifiersFromText(text, source) {
-  const identifiers = [];
-  const seen = new Set();
-  const patterns = [
-    /(?:gtin(?:[-_ ]?(?:8|12|13|14))?|ean(?:[-_ ]?(?:8|13))?|upc(?:[-_ ]?a)?|c[oó]digo\s+universal)[^0-9]{0,60}([0-9][0-9\s.-]{6,24}[0-9])/gi,
-    /"(?:gtin(?:8|12|13|14)?|ean|upc|productID|barcode)"\s*:\s*"?([0-9]{8,14})"?/gi
-  ];
-
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(String(text || ""))) !== null) {
-      const value = normalizeEan(match[1]);
-      if (!isValidProductIdentifier(value) || seen.has(value)) continue;
-      seen.add(value);
-      identifiers.push({
-        type: classifyProductIdentifier(value),
-        attribute_id: "LABELED_TEXT",
-        value,
-        source
-      });
-    }
-  }
-
-  return identifiers;
-}
-
-function collectJsonLdIdentifiers(html, source) {
-  const identifiers = [];
-  const pattern = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  let match;
-
-  while ((match = pattern.exec(String(html || ""))) !== null) {
-    try {
-      const parsed = JSON.parse(match[1].trim());
-      identifiers.push(...extractProductIdentifiers(parsed, source));
-    } catch (error) {
-      identifiers.push(...extractLabeledIdentifiersFromText(match[1], source));
-    }
-  }
-
-  identifiers.push(...extractLabeledIdentifiersFromText(html, source));
-  return identifiers;
-}
-
-async function executeWebIdentifierAttempt(spec, attempts, fingerprints) {
-  const startedAt = Date.now();
-
-  try {
-    const response = await http.get(spec.url, {
-      headers: {
-        Accept: "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 (compatible; MeliIdentifierResolver/4.0)"
-      }
-    });
-    const html = typeof response.data === "string" ? response.data : JSON.stringify(response.data || {});
-    const identifiers = response.status >= 200 && response.status < 300
-      ? collectJsonLdIdentifiers(html, spec.source)
-      : [];
-    const fingerprint = responseFingerprint(html);
-    const duplicateOf = fingerprint && fingerprints.has(fingerprint) ? fingerprints.get(fingerprint) : null;
-    if (fingerprint && !duplicateOf) fingerprints.set(fingerprint, spec.attemptId);
-    const record = {
-      attempt_id: spec.attemptId,
-      source: spec.source,
-      endpoint: spec.url,
-      authentication: "public_web",
-      parameters: {},
-      catalog_product_id: spec.catalogProductId || null,
-      item_id: spec.itemId || null,
-      http_status: response.status,
-      duration_ms: Date.now() - startedAt,
-      response_keys: [],
-      attributes_count: 0,
-      variations_count: 0,
-      pictures_count: 0,
-      identifiers_found: identifiers.map(identifier => identifier.value),
-      response_fingerprint: fingerprint,
-      response_duplicate_of: duplicateOf,
-      response_preview: response.status >= 400 ? html.slice(0, config.upcAttemptLogBodyChars) : "",
-      continued: true
-    };
-    recordIdentifierAttempt(attempts, record);
-    return { ok: response.status >= 200 && response.status < 300, identifiers, status: response.status, html, record };
-  } catch (error) {
-    const record = {
-      attempt_id: spec.attemptId,
-      source: spec.source,
-      endpoint: spec.url,
-      authentication: "public_web",
-      parameters: {},
-      catalog_product_id: spec.catalogProductId || null,
-      item_id: spec.itemId || null,
-      http_status: error.response?.status || 0,
-      duration_ms: Date.now() - startedAt,
-      identifiers_found: [],
-      api_error: "web_request_error",
-      response_preview: safeAttemptPreview(error.response?.data || error.message),
-      continued: true
-    };
-    recordIdentifierAttempt(attempts, record);
-    return { ok: false, identifiers: [], status: record.http_status, error, record };
-  }
-}
-
-function addPayloadToMap(payloadMap, id, data, source, attemptId) {
-  if (!id || !data || typeof data !== "object") return;
-  if (!payloadMap.has(id)) payloadMap.set(id, []);
-  const fingerprint = responseFingerprint(data);
-  const entries = payloadMap.get(id);
-  if (fingerprint && entries.some(entry => entry.fingerprint === fingerprint)) return;
-  entries.push({ data, source, attempt_id: attemptId, fingerprint });
-}
-
-function getCatalogWebUrl(catalogProductId) {
-  const siteDomains = {
-    MLA: "www.mercadolibre.com.ar",
-    MLB: "www.mercadolivre.com.br",
-    MLM: "www.mercadolibre.com.mx",
-    MLC: "www.mercadolibre.cl",
-    MCO: "www.mercadolibre.com.co",
-    MPE: "www.mercadolibre.com.pe",
-    MLU: "www.mercadolibre.com.uy"
-  };
-  const host = siteDomains[config.meliSiteId] || siteDomains.MLA;
-  return `https://${host}/p/${catalogProductId}`;
-}
-
-function buildAttemptSummary(attempts) {
-  const summary = {
-    total: attempts.length,
-    succeeded: 0,
-    forbidden: 0,
-    not_found: 0,
-    rate_limited: 0,
-    failed: 0,
-    public: 0,
-    bearer: 0,
-    public_web: 0,
-    with_identifiers: 0
-  };
-
-  for (const attempt of attempts) {
-    if (attempt.authentication === "public") summary.public += 1;
-    if (attempt.authentication === "bearer") summary.bearer += 1;
-    if (attempt.authentication === "public_web") summary.public_web += 1;
-    if (attempt.http_status >= 200 && attempt.http_status < 300) summary.succeeded += 1;
-    else if (attempt.http_status === 403 || attempt.inner_status === 403) summary.forbidden += 1;
-    else if (attempt.http_status === 404 || attempt.inner_status === 404) summary.not_found += 1;
-    else if (attempt.http_status === 429 || attempt.inner_status === 429) summary.rate_limited += 1;
-    else summary.failed += 1;
-    if (Array.isArray(attempt.identifiers_found) && attempt.identifiers_found.length) summary.with_identifiers += 1;
-  }
-
-  return summary;
-}
-
-async function scanCatalogProductMatrix(rootCatalogProductId, evidenceStore, attempts, fingerprints, verificationRootCatalogProductId = rootCatalogProductId) {
-  const queue = [{ id: rootCatalogProductId, depth: 0 }];
-  const visitedCatalogProductIds = new Set();
-  const itemIds = new Set();
-  const rawOffers = [];
-  const permalinks = new Set();
-  const userProductIds = new Set();
-  let rootProduct = null;
-  let complete = true;
-
-  while (queue.length && visitedCatalogProductIds.size < config.maxUpcCatalogProducts) {
-    const current = queue.shift();
-    if (!current || visitedCatalogProductIds.has(current.id) || current.depth > config.maxUpcCatalogDepth) continue;
-    visitedCatalogProductIds.add(current.id);
-    let currentProductSucceeded = false;
-    let currentOffersSucceeded = false;
-
-    for (const auth of [true, false]) {
-      const mode = auth ? "auth" : "public";
-      const productAttempt = await executeMeliIdentifierAttempt({
-        attemptId: `catalog_${current.id}_${mode}`,
-        endpoint: `/products/${current.id}`,
-        auth,
-        source: `catalog_product_api_${mode}`,
-        catalogProductId: current.id
-      }, attempts, fingerprints);
-
-      if (productAttempt.ok) {
-        currentProductSucceeded = true;
-        if (current.id === rootCatalogProductId && !rootProduct) rootProduct = productAttempt.data;
-        mergeIdentifierEvidence(evidenceStore, productAttempt.identifiers, {
-          source: `catalog_product_api_${mode}`,
-          catalog_product_id: current.id,
-          catalog_direct: current.id === verificationRootCatalogProductId,
-          catalog_tree_direct: current.id !== verificationRootCatalogProductId
-        });
-        const refs = extractReferenceValues(productAttempt.data);
-        for (const url of refs.permalinks) permalinks.add(url);
-        for (const upId of refs.userProductIds) userProductIds.add(upId);
-        if (current.depth < config.maxUpcCatalogDepth) {
-          for (const childId of [...refs.childCatalogProductIds, ...refs.catalogProductIds]) {
-            if (childId !== current.id && !visitedCatalogProductIds.has(childId)) {
-              queue.push({ id: childId, depth: current.depth + 1 });
-            }
-          }
-        }
-      }
-
-      let offset = 0;
-      let offerRouteComplete = true;
-      for (let page = 0; page < config.maxCatalogItemPages; page += 1) {
-        const offerAttempt = await executeMeliIdentifierAttempt({
-          attemptId: `catalog_items_${current.id}_${mode}_${page + 1}`,
-          endpoint: `/products/${current.id}/items`,
-          params: { limit: config.catalogItemsPageSize, offset },
-          auth,
-          source: `catalog_items_api_${mode}`,
-          catalogProductId: current.id
-        }, attempts, fingerprints);
-
-        if (!offerAttempt.ok) {
-          offerRouteComplete = false;
-          break;
-        }
-
-        const pageRaw = extractResults(offerAttempt.data);
-        const paging = extractPaging(offerAttempt.data, offset, config.catalogItemsPageSize, pageRaw.length);
-        for (const raw of pageRaw) {
-          rawOffers.push(raw);
-          const offer = normalizeCatalogOffer(raw, current.id, `catalog_items_api_${mode}`);
-          if (offer?.item_id) itemIds.add(offer.item_id);
-          if (offer?.link) permalinks.add(offer.link);
-          const identifiers = extractProductIdentifiers(raw, `catalog_items_api_${mode}`);
-          mergeIdentifierEvidence(evidenceStore, identifiers, {
-            source: `catalog_items_api_${mode}`,
-            item_id: offer?.item_id || null,
-            catalog_product_id: current.id
-          });
-          const refs = extractReferenceValues(raw);
-          for (const itemId of refs.itemIds) itemIds.add(itemId);
-          for (const url of refs.permalinks) permalinks.add(url);
-          for (const upId of refs.userProductIds) userProductIds.add(upId);
-          if (current.depth < config.maxUpcCatalogDepth) {
-            for (const catalogId of refs.catalogProductIds) {
-              if (catalogId !== current.id && !visitedCatalogProductIds.has(catalogId)) {
-                queue.push({ id: catalogId, depth: current.depth + 1 });
-              }
-            }
-          }
-        }
-
-        if (!pageRaw.length || !paging.has_more || paging.next_offset <= offset) break;
-        offset = paging.next_offset;
-        if (page === config.maxCatalogItemPages - 1) offerRouteComplete = false;
-      }
-      if (offerRouteComplete) currentOffersSucceeded = true;
-
-      let searchOffset = 0;
-      for (let page = 0; page < config.maxCatalogItemPages; page += 1) {
-        const searchAttempt = await executeMeliIdentifierAttempt({
-          attemptId: `site_search_catalog_${current.id}_${mode}_${page + 1}`,
-          endpoint: `/sites/${config.meliSiteId}/search`,
-          params: { catalog_product_id: current.id, limit: 50, offset: searchOffset },
-          auth,
-          source: `site_search_catalog_${mode}`,
-          catalogProductId: current.id
-        }, attempts, fingerprints);
-
-        if (!searchAttempt.ok) break;
-        const searchResults = extractResults(searchAttempt.data);
-        for (const raw of searchResults) {
-          const offer = normalizeCatalogOffer(raw, current.id, `site_search_catalog_${mode}`);
-          if (offer?.item_id) itemIds.add(offer.item_id);
-          if (offer?.link) permalinks.add(offer.link);
-          mergeIdentifierEvidence(evidenceStore, extractProductIdentifiers(raw, `site_search_catalog_${mode}`), {
-            source: `site_search_catalog_${mode}`,
-            item_id: offer?.item_id || null,
-            catalog_product_id: current.id
-          });
-          const refs = extractReferenceValues(raw);
-          for (const itemId of refs.itemIds) itemIds.add(itemId);
-          for (const url of refs.permalinks) permalinks.add(url);
-          for (const upId of refs.userProductIds) userProductIds.add(upId);
-          if (current.depth < config.maxUpcCatalogDepth) {
-            for (const catalogId of refs.catalogProductIds) {
-              if (catalogId !== current.id && !visitedCatalogProductIds.has(catalogId)) {
-                queue.push({ id: catalogId, depth: current.depth + 1 });
-              }
-            }
-          }
-        }
-        const paging = extractPaging(searchAttempt.data, searchOffset, 50, searchResults.length);
-        if (!searchResults.length || !paging.has_more || paging.next_offset <= searchOffset) break;
-        searchOffset = paging.next_offset;
-      }
-    }
-
-    if (!currentProductSucceeded || !currentOffersSucceeded) complete = false;
-  }
-
-  if (queue.length) complete = false;
-
-  return {
-    rootProduct,
-    catalogProductIds: [...visitedCatalogProductIds],
-    itemIds: [...itemIds],
-    rawOffers,
-    permalinks: [...permalinks],
-    userProductIds: [...userProductIds],
-    complete
-  };
-}
-
-async function scanItemMatrix(itemIds, evidenceStore, attempts, fingerprints, payloadMap) {
-  const uniqueItemIds = [...new Set(itemIds.map(normalizeItemId).filter(Boolean))];
-  const limitedItemIds = uniqueItemIds.slice(0, config.maxUpcAssociatedItems);
-  const accessibleItemIds = new Set();
-  const forbiddenItemIds = new Set();
-  const fields = "id,title,catalog_product_id,parent_item_id,user_product_id,family_id,category_id,permalink,attributes,variations,pictures";
-  const profiles = [
-    { id: "fields_auth", auth: true, params: { attributes: fields } },
-    { id: "plain_auth", auth: true, params: {} },
-    { id: "internal_auth", auth: true, params: { include_internal_attributes: true } },
-    { id: "fields_public", auth: false, params: { attributes: fields } },
-    { id: "plain_public", auth: false, params: {} },
-    { id: "internal_public", auth: false, params: { include_internal_attributes: true } }
-  ];
-
-  for (let index = 0; index < limitedItemIds.length; index += config.upcItemBatchSize) {
-    const batch = limitedItemIds.slice(index, index + config.upcItemBatchSize);
-
-    for (const profile of profiles) {
-      const attempt = await executeMeliIdentifierAttempt({
-        attemptId: `items_bulk_${profile.id}_${Math.floor(index / config.upcItemBatchSize) + 1}`,
-        endpoint: "/items",
-        params: { ids: batch.join(","), ...profile.params },
-        auth: profile.auth,
-        source: `items_bulk_${profile.id}`
-      }, attempts, fingerprints);
-
-      if (!attempt.ok) {
-        if (attempt.status === 403) for (const itemId of batch) forbiddenItemIds.add(itemId);
-        continue;
-      }
-
-      const responses = Array.isArray(attempt.data) ? attempt.data : [attempt.data];
-      for (const response of responses) {
-        const innerStatus = Number(response?.code || response?.status || 200);
-        const body = response?.body && typeof response.body === "object" ? response.body : response;
-        const bodyItemId = normalizeItemId(firstString(body?.id, body?.item_id));
-        const matchedItemId = bodyItemId || (batch.length === 1 ? batch[0] : "");
-        const identifiers = innerStatus >= 200 && innerStatus < 300
-          ? extractProductIdentifiers(body, `items_bulk_${profile.id}`)
-          : [];
-        recordIdentifierAttempt(attempts, {
-          attempt_id: `${attempt.record.attempt_id}_${matchedItemId || "unknown"}_inner`,
-          source: `items_bulk_${profile.id}`,
-          endpoint: "/items",
-          authentication: profile.auth ? "bearer" : "public",
-          parameters: summarizeAttemptParams({ ids: batch.join(","), ...profile.params }),
-          item_id: matchedItemId || null,
-          http_status: attempt.status,
-          inner_status: innerStatus,
-          duration_ms: 0,
-          response_keys: body && typeof body === "object" ? Object.keys(body).slice(0, 40) : [],
-          identifiers_found: identifiers.map(identifier => identifier.value),
-          response_preview: innerStatus >= 400 ? safeAttemptPreview(body) : "",
-          continued: true
-        });
-        if (!matchedItemId) continue;
-        if (innerStatus >= 200 && innerStatus < 300 && body && typeof body === "object") {
-          accessibleItemIds.add(matchedItemId);
-          addPayloadToMap(payloadMap, matchedItemId, body, `items_bulk_${profile.id}`, attempt.record.attempt_id);
-          mergeIdentifierEvidence(evidenceStore, identifiers, {
-            source: `items_bulk_${profile.id}`,
-            item_id: matchedItemId
-          });
-        } else if (innerStatus === 403) {
-          forbiddenItemIds.add(matchedItemId);
-        }
-      }
-    }
-  }
-
-  for (const itemId of limitedItemIds) {
-    for (const profile of profiles) {
-      const attempt = await executeMeliIdentifierAttempt({
-        attemptId: `item_${itemId}_${profile.id}`,
-        endpoint: `/items/${itemId}`,
-        params: profile.params,
-        auth: profile.auth,
-        source: `item_api_${profile.id}`,
-        itemId
-      }, attempts, fingerprints);
-
-      if (attempt.ok) {
-        accessibleItemIds.add(itemId);
-        addPayloadToMap(payloadMap, itemId, attempt.data, `item_api_${profile.id}`, attempt.record.attempt_id);
-        mergeIdentifierEvidence(evidenceStore, attempt.identifiers, {
-          source: `item_api_${profile.id}`,
-          item_id: itemId
-        });
-      } else if (attempt.status === 403) {
-        forbiddenItemIds.add(itemId);
-      }
-    }
-  }
-
-  return {
-    requestedItemIds: limitedItemIds,
-    accessibleItemIds: [...accessibleItemIds],
-    forbiddenItemIds: [...forbiddenItemIds],
-    truncated: limitedItemIds.length < uniqueItemIds.length
-  };
-}
-
-async function scanDescriptions(itemIds, evidenceStore, attempts, fingerprints) {
-  for (const itemId of itemIds) {
-    for (const auth of [true, false]) {
-      const mode = auth ? "auth" : "public";
-      const attempt = await executeMeliIdentifierAttempt({
-        attemptId: `description_${itemId}_${mode}`,
-        endpoint: `/items/${itemId}/description`,
-        auth,
-        source: `item_description_${mode}`,
-        itemId
-      }, attempts, fingerprints);
-      if (!attempt.ok) continue;
-      const text = firstString(
-        attempt.data?.plain_text,
-        attempt.data?.text,
-        attempt.data?.description,
-        JSON.stringify(attempt.data || {})
-      );
-      const identifiers = extractLabeledIdentifiersFromText(text, `item_description_${mode}`);
-      mergeIdentifierEvidence(evidenceStore, identifiers, {
-        source: `item_description_${mode}`,
-        item_id: itemId
-      });
-    }
-  }
-}
-
-async function scanUserProducts(userProductIds, evidenceStore, attempts, fingerprints) {
-  const queue = [...new Set(userProductIds.map(normalizeUserProductId).filter(Boolean))];
-  const visitedUserProductIds = new Set();
-  const accessibleUserProductIds = new Set();
-  const visitedFamilyModes = new Set();
-  const familyIds = new Set();
-  const catalogProductIds = new Set();
-
-  while (queue.length && visitedUserProductIds.size < config.maxUpcUserProducts) {
-    const userProductId = queue.shift();
-    if (!userProductId || visitedUserProductIds.has(userProductId)) continue;
-    visitedUserProductIds.add(userProductId);
-
-    for (const auth of [true, false]) {
-      const mode = auth ? "auth" : "public";
-      const attempt = await executeMeliIdentifierAttempt({
-        attemptId: `user_product_${userProductId}_${mode}`,
-        endpoint: `/user-products/${userProductId}`,
-        auth,
-        source: `user_product_api_${mode}`,
-        userProductId
-      }, attempts, fingerprints);
-      if (!attempt.ok) continue;
-      accessibleUserProductIds.add(userProductId);
-      mergeIdentifierEvidence(evidenceStore, attempt.identifiers, { source: `user_product_api_${mode}` });
-      const refs = extractReferenceValues(attempt.data);
-      for (const catalogId of refs.catalogProductIds) catalogProductIds.add(catalogId);
-      for (const linkedUserProductId of refs.userProductIds) {
-        if (!visitedUserProductIds.has(linkedUserProductId)) queue.push(linkedUserProductId);
-      }
-
-      for (const familyId of refs.familyIds) {
-        familyIds.add(familyId);
-        const familyKey = `${familyId}:${mode}`;
-        if (visitedFamilyModes.has(familyKey)) continue;
-        visitedFamilyModes.add(familyKey);
-        const familyAttempt = await executeMeliIdentifierAttempt({
-          attemptId: `user_product_family_${familyId}_${mode}`,
-          endpoint: `/sites/${config.meliSiteId}/user-products-families/${familyId}`,
-          auth,
-          source: `user_product_family_api_${mode}`,
-          familyId
-        }, attempts, fingerprints);
-        if (!familyAttempt.ok) continue;
-        mergeIdentifierEvidence(evidenceStore, familyAttempt.identifiers, { source: `user_product_family_api_${mode}` });
-        const familyRefs = extractReferenceValues(familyAttempt.data);
-        for (const familyUserProductId of familyRefs.userProductIds) {
-          if (!visitedUserProductIds.has(familyUserProductId)) queue.push(familyUserProductId);
-        }
-        const listedIds = Array.isArray(familyAttempt.data?.user_products_ids)
-          ? familyAttempt.data.user_products_ids
-          : [];
-        for (const listedId of listedIds) {
-          const normalized = normalizeUserProductId(listedId);
-          if (normalized && !visitedUserProductIds.has(normalized)) queue.push(normalized);
-        }
-      }
-    }
-  }
-
-  return {
-    userProductIds: [...visitedUserProductIds],
-    accessibleUserProductIds: [...accessibleUserProductIds],
-    familyIds: [...familyIds],
-    catalogProductIds: [...catalogProductIds],
-    truncated: queue.length > 0
-  };
-}
-
-async function verifyIdentifierEvidenceExhaustive(catalogProductId, validCatalogProductIds, evidenceList, attempts, fingerprints) {
-  const validCatalogIds = new Set([catalogProductId, ...validCatalogProductIds]);
-  return mapWithConcurrency(evidenceList, config.productConcurrency, async evidence => {
-    if (evidence.catalog_direct) {
-      evidence.verified = true;
-      evidence.verification_status = "catalog_direct";
-      evidence.reverse_catalog_product_ids.add(catalogProductId);
-      return evidence;
-    }
-
-    if (evidence.catalog_tree_direct) {
-      evidence.verified = true;
-      evidence.verification_status = "catalog_tree_direct";
-      for (const linkedCatalogId of evidence.catalog_product_ids) {
-        evidence.reverse_catalog_product_ids.add(linkedCatalogId);
-      }
-      return evidence;
-    }
-
-    let anySuccess = false;
-    for (const auth of [true, false]) {
-      const mode = auth ? "auth" : "public";
-      const attempt = await executeMeliIdentifierAttempt({
-        attemptId: `reverse_${evidence.value}_${mode}`,
-        endpoint: "/products/search",
-        params: {
-          site_id: config.meliSiteId,
-          product_identifier: evidence.value,
-          status: "active"
-        },
-        auth,
-        source: `reverse_product_search_${mode}`,
-        catalogProductId
-      }, attempts, fingerprints);
-      if (!attempt.ok) continue;
-      anySuccess = true;
-      for (const result of extractResults(attempt.data).map(normalizeCatalogProduct).filter(Boolean)) {
-        evidence.reverse_catalog_product_ids.add(result.catalog_product_id);
-      }
-    }
-
-    const reverseIds = [...evidence.reverse_catalog_product_ids];
-    if (reverseIds.some(reverseId => validCatalogIds.has(reverseId))) {
-      evidence.verified = true;
-      evidence.verification_status = reverseIds.includes(catalogProductId) ? "reverse_match" : "reverse_catalog_tree_match";
-    } else if (reverseIds.length) {
-      evidence.verification_status = "reverse_other_catalog";
-    } else if (anySuccess) {
-      evidence.verification_status = "reverse_no_match";
-    } else {
-      evidence.verification_status = "reverse_api_error";
-    }
-    return evidence;
-  });
-}
-
-async function resolveUpcsByMla(entry) {
-  const rowNumber = entry && typeof entry === "object" ? entry.row_number || null : null;
-  const rawMla = entry && typeof entry === "object" ? entry.mla : entry;
-  const input = String(rawMla || "").trim();
-  const mla = normalizeMlaId(input);
-
-  if (!mla) {
-    return {
-      row_number: rowNumber,
-      input,
-      mla: null,
-      title: "",
-      catalog_product_id: null,
-      primary_identifier: null,
-      upc: null,
-      upcs: [],
-      gtins: [],
-      candidate_upcs: [],
-      candidate_gtins: [],
-      identifiers: [],
-      status: "invalid_mla",
-      error: "MLA Catalog inválido",
-      checked_at: nowIso()
-    };
-  }
-
-  const evidenceStore = new Map();
-  const attempts = [];
-  const fingerprints = new Map();
-  const payloadMap = new Map();
-  const allItemIds = new Set();
-  const allPermalinks = new Set();
-  const allImageUrls = new Set();
-  const allUserProductIds = new Set();
-
-  const catalogScan = await scanCatalogProductMatrix(mla, evidenceStore, attempts, fingerprints);
-  const catalogProduct = catalogScan.rootProduct;
-  const allCatalogProductIds = new Set(catalogScan.catalogProductIds);
-  let catalogScansComplete = catalogScan.complete;
-
-  if (!catalogProduct) {
-    const rootAttempts = attempts.filter(attempt => attempt.catalog_product_id === mla && attempt.source.startsWith("catalog_product_api"));
-    const rootNotFound = rootAttempts.length > 0 && rootAttempts.every(attempt => attempt.http_status === 404);
-    return {
-      row_number: rowNumber,
-      input,
-      mla,
-      title: "",
-      catalog_product_id: mla,
-      primary_identifier: null,
-      upc: null,
-      upcs: [],
-      gtins: [],
-      candidate_upcs: [],
-      candidate_gtins: [],
-      identifiers: [],
-      status: rootNotFound ? "item_not_found" : "partial_scan",
-      error: rootNotFound ? "El producto MLA Catalog no existe o no está disponible" : "No fue posible consultar el producto de catálogo por ninguna ruta",
-      attempt_summary: buildAttemptSummary(attempts),
-      attempts: attempts.slice(0, 200),
-      attempts_truncated: attempts.length > 200,
-      api_http_status: rootNotFound ? 404 : 503,
-      retryable: !rootNotFound,
-      requires_reauthorization: false,
-      checked_at: nowIso()
-    };
-  }
-
-  for (const itemId of catalogScan.itemIds) allItemIds.add(itemId);
-  for (const url of catalogScan.permalinks) allPermalinks.add(url);
-  for (const userProductId of catalogScan.userProductIds) allUserProductIds.add(userProductId);
-
-  let itemScan = await scanItemMatrix([...allItemIds], evidenceStore, attempts, fingerprints, payloadMap);
-  const visitedItemIds = new Set(itemScan.requestedItemIds);
-  const accessibleItemIds = new Set(itemScan.accessibleItemIds);
-  const forbiddenItemIds = new Set(itemScan.forbiddenItemIds);
-  let relatedItemsTruncated = itemScan.truncated;
-
-  for (let relationDepth = 0; relationDepth < 2; relationDepth += 1) {
-    const relatedItemIds = new Set();
-    for (const [itemId, payloads] of payloadMap.entries()) {
-      for (const payload of payloads) {
-        const refs = extractReferenceValues(payload.data);
-        for (const parentItemId of refs.parentItemIds) {
-          if (!visitedItemIds.has(parentItemId)) relatedItemIds.add(parentItemId);
-        }
-        for (const linkedItemId of refs.itemIds) {
-          if (linkedItemId !== itemId && !visitedItemIds.has(linkedItemId)) relatedItemIds.add(linkedItemId);
-        }
-        for (const userProductId of refs.userProductIds) allUserProductIds.add(userProductId);
-        for (const url of refs.permalinks) allPermalinks.add(url);
-        for (const url of refs.imageUrls) allImageUrls.add(url);
-      }
-    }
-
-    const nextRelatedItems = [...relatedItemIds].slice(0, config.maxUpcRelatedItems);
-    if (!nextRelatedItems.length) break;
-    if (nextRelatedItems.length < relatedItemIds.size) relatedItemsTruncated = true;
-    for (const itemId of nextRelatedItems) {
-      visitedItemIds.add(itemId);
-      allItemIds.add(itemId);
-    }
-    const relatedScan = await scanItemMatrix(nextRelatedItems, evidenceStore, attempts, fingerprints, payloadMap);
-    for (const itemId of relatedScan.accessibleItemIds) accessibleItemIds.add(itemId);
-    for (const itemId of relatedScan.forbiddenItemIds) forbiddenItemIds.add(itemId);
-    if (relatedScan.truncated) relatedItemsTruncated = true;
-  }
-
-  const referencedCatalogProductIds = new Set();
-  for (const payloads of payloadMap.values()) {
-    for (const payload of payloads) {
-      const refs = extractReferenceValues(payload.data);
-      for (const catalogId of [...refs.catalogProductIds, ...refs.childCatalogProductIds]) {
-        if (!allCatalogProductIds.has(catalogId)) referencedCatalogProductIds.add(catalogId);
-      }
-    }
-  }
-
-  const remainingCatalogCapacity = Math.max(0, config.maxUpcCatalogProducts - allCatalogProductIds.size);
-  const additionalCatalogProductIds = [...referencedCatalogProductIds].slice(0, remainingCatalogCapacity);
-  if (additionalCatalogProductIds.length < referencedCatalogProductIds.size) catalogScansComplete = false;
-
-  for (const catalogId of additionalCatalogProductIds) {
-    const additionalCatalogScan = await scanCatalogProductMatrix(
-      catalogId,
-      evidenceStore,
-      attempts,
-      fingerprints,
-      mla
-    );
-    if (!additionalCatalogScan.complete) catalogScansComplete = false;
-    for (const scannedCatalogId of additionalCatalogScan.catalogProductIds) allCatalogProductIds.add(scannedCatalogId);
-    for (const url of additionalCatalogScan.permalinks) allPermalinks.add(url);
-    for (const userProductId of additionalCatalogScan.userProductIds) allUserProductIds.add(userProductId);
-    const newItemIds = additionalCatalogScan.itemIds.filter(itemId => !visitedItemIds.has(itemId));
-    for (const itemId of newItemIds) {
-      visitedItemIds.add(itemId);
-      allItemIds.add(itemId);
-    }
-    if (newItemIds.length) {
-      const additionalItemScan = await scanItemMatrix(newItemIds, evidenceStore, attempts, fingerprints, payloadMap);
-      for (const itemId of additionalItemScan.accessibleItemIds) accessibleItemIds.add(itemId);
-      for (const itemId of additionalItemScan.forbiddenItemIds) forbiddenItemIds.add(itemId);
-      if (additionalItemScan.truncated) relatedItemsTruncated = true;
-    }
-  }
-
-  for (const [itemId, payloads] of payloadMap.entries()) {
-    for (const payload of payloads) {
-      const refs = extractReferenceValues(payload.data);
-      for (const userProductId of refs.userProductIds) allUserProductIds.add(userProductId);
-      for (const url of refs.permalinks) allPermalinks.add(url);
-      for (const url of refs.imageUrls) allImageUrls.add(url);
-      mergeIdentifierEvidence(evidenceStore, extractProductIdentifiers(payload.data, payload.source), {
-        source: payload.source,
-        item_id: itemId
-      });
-    }
-  }
-
-  const userProductScan = await scanUserProducts([...allUserProductIds], evidenceStore, attempts, fingerprints);
-  await scanDescriptions([...visitedItemIds], evidenceStore, attempts, fingerprints);
-
-  const webTargets = [{
-    url: getCatalogWebUrl(mla),
-    source: "catalog_public_web",
-    catalogProductId: mla,
-    itemId: null
-  }];
-  for (const url of allPermalinks) {
-    webTargets.push({ url, source: "item_public_web", catalogProductId: mla, itemId: null });
-  }
-  const uniqueWebTargets = [...new Map(webTargets.map(target => [target.url, target])).values()]
-    .slice(0, config.maxUpcWebPages);
-
-  for (let index = 0; index < uniqueWebTargets.length; index += 1) {
-    const target = uniqueWebTargets[index];
-    const webAttempt = await executeWebIdentifierAttempt({
-      attemptId: `public_web_${index + 1}`,
-      ...target
-    }, attempts, fingerprints);
-    if (webAttempt.ok) {
-      mergeIdentifierEvidence(evidenceStore, webAttempt.identifiers, { source: target.source });
-    }
-  }
-
-  const evidence = await verifyIdentifierEvidenceExhaustive(
-    mla,
-    [...allCatalogProductIds],
-    [...evidenceStore.values()],
-    attempts,
-    fingerprints
-  );
-  const serializedIdentifiers = evidence
-    .sort((a, b) => {
-      if (a.verified !== b.verified) return a.verified ? -1 : 1;
-      if (a.type === "UPC" && b.type !== "UPC") return -1;
-      if (a.type !== "UPC" && b.type === "UPC") return 1;
-      return a.value.localeCompare(b.value);
-    })
-    .map(serializeIdentifierEvidence);
-
-  const verifiedIdentifiers = serializedIdentifiers.filter(identifier => identifier.verified);
-  const candidateIdentifiers = serializedIdentifiers.filter(identifier => !identifier.verified);
-  const primaryIdentifier = verifiedIdentifiers.find(identifier => identifier.type === "UPC") || verifiedIdentifiers[0] || null;
-  const primaryUpc = verifiedIdentifiers.find(identifier => identifier.type === "UPC") || null;
-  const itemScanComplete = !relatedItemsTruncated && [...visitedItemIds].every(itemId => accessibleItemIds.has(itemId));
-  const userProductScanComplete = !userProductScan.truncated && userProductScan.userProductIds.every(
-    userProductId => userProductScan.accessibleUserProductIds.includes(userProductId)
-  );
-  const scanComplete = catalogScansComplete && itemScanComplete && userProductScanComplete;
-  let status = "identifier_not_available";
-  let error = "";
-  let warning = "";
-
-  if (verifiedIdentifiers.length) {
-    status = "ok";
-    if (!scanComplete) warning = "Se encontraron identificadores verificados, pero no se pudieron revisar todas las publicaciones asociadas";
-  } else if (candidateIdentifiers.length) {
-    status = "identifier_candidates";
-    warning = "Se encontraron identificadores en publicaciones asociadas, pero MercadoLibre no confirmó su relación inversa con el producto de catálogo";
-  } else if (!scanComplete) {
-    status = "partial_scan";
-    error = "No se encontraron identificadores y no fue posible revisar todas las publicaciones asociadas";
-  } else {
-    error = "MercadoLibre no expone un UPC, EAN o GTIN verificable en el producto de catálogo ni en sus publicaciones asociadas";
-  }
-
-  logger.info({
-    catalog_product_id: mla,
-    productos_catalogo_consultados: allCatalogProductIds.size,
-    publicaciones_asociadas: visitedItemIds.size,
-    publicaciones_consultadas: accessibleItemIds.size,
-    publicaciones_con_acceso_denegado: [...forbiddenItemIds].filter(itemId => !accessibleItemIds.has(itemId)).length,
-    user_products_consultados: userProductScan.userProductIds.length,
-    familias_user_products_consultadas: userProductScan.familyIds.length,
-    paginas_web_consultadas: uniqueWebTargets.length,
-    imagenes_publicas_detectadas: allImageUrls.size,
-    identificadores_verificados: verifiedIdentifiers.map(identifier => identifier.value),
-    identificadores_candidatos: candidateIdentifiers.map(identifier => identifier.value),
-    intentos: buildAttemptSummary(attempts),
-    recorrido_completo: scanComplete,
-    estado: status
-  }, "Finalizó el rastreo exhaustivo de identificadores por producto de catálogo");
-
-  return {
-    row_number: rowNumber,
-    input,
-    mla,
-    title: firstString(catalogProduct?.name, catalogProduct?.title),
-    catalog_product_id: mla,
-    primary_identifier: primaryIdentifier ? primaryIdentifier.value : null,
-    upc: primaryUpc ? primaryUpc.value : null,
-    upcs: verifiedIdentifiers.filter(identifier => identifier.type === "UPC").map(identifier => identifier.value),
-    gtins: verifiedIdentifiers.map(identifier => identifier.value),
-    candidate_upcs: candidateIdentifiers.filter(identifier => identifier.type === "UPC").map(identifier => identifier.value),
-    candidate_gtins: candidateIdentifiers.map(identifier => identifier.value),
-    identifiers: serializedIdentifiers,
-    catalog_products_scanned: [...allCatalogProductIds],
-    associated_items_found: visitedItemIds.size,
-    associated_items_scanned: accessibleItemIds.size,
-    access_denied_items: [...forbiddenItemIds].filter(itemId => !accessibleItemIds.has(itemId)),
-    user_products_scanned: userProductScan.userProductIds,
-    user_product_families_scanned: userProductScan.familyIds,
-    public_web_pages_scanned: uniqueWebTargets.length,
-    public_images_detected: allImageUrls.size,
-    attempt_summary: buildAttemptSummary(attempts),
-    attempts: attempts.slice(0, 200),
-    attempts_truncated: attempts.length > 200,
-    scan_complete: scanComplete,
-    status,
-    error,
-    warning,
-    api_http_status: 200,
-    retryable: !scanComplete,
-    requires_reauthorization: false,
-    checked_at: nowIso()
-  };
 }
 
 async function notifyN8nJobCreated(job) {
@@ -3614,6 +2133,8 @@ async function notifyN8nJobCreated(job) {
     job_type: job.job_type,
     sheet_url: job.sheet_url,
     sheet_name: job.sheet_name,
+    site_id: job.site_id,
+    currency_id: job.currency_id,
     email: job.email || "",
     created_at: job.created_at
   };
@@ -3698,10 +2219,8 @@ app.get("/", (req, res) => {
     meli_status: "/meli/status",
     oauth_start: "/auth/mercadolibre/start",
     ean_job_start: "/jobs",
-    upc_job_start: "/upc-jobs",
     ean_queue: "/monitor/queue",
-    upc_queue: "/lookup-upcs/queue",
-    upc_lookup: "/lookup-upcs"
+    supported_sites: Object.keys(marketSites)
   });
 });
 
@@ -3780,14 +2299,13 @@ app.post("/meli/test-product", requireN8n, async (req, res) => {
     ean: parsed.data.ean,
     brand: parsed.data.brand,
     name: parsed.data.name
-  });
+  }, parsed.data.site_id || config.meliSiteId);
 
   return res.status(["ok", "partial_ok"].includes(result.status) ? 200 : 404).json({
     ok: ["ok", "partial_ok"].includes(result.status),
     result
   });
 });
-
 
 app.post("/monitor/queue", requireN8n, async (req, res) => {
   try {
@@ -3810,7 +2328,7 @@ app.post("/monitor/queue", requireN8n, async (req, res) => {
       batchIndex,
       totalBatches,
       totalProducts,
-      payload: { products: body.products }
+      payload: { products: body.products, site_id: body.site_id }
     });
 
     setImmediate(() => runBatchWorkerCycle().catch(() => {}));
@@ -3837,169 +2355,6 @@ app.post("/monitor/queue", requireN8n, async (req, res) => {
   }
 });
 
-app.post("/lookup-upcs/queue", requireN8n, async (req, res) => {
-  try {
-    const parsed = upcLookupSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ ok: false, error: "invalid_payload", details: parsed.error.flatten() });
-    }
-
-    const body = parsed.data;
-    if (!body.job_id) {
-      return res.status(400).json({ ok: false, error: "job_id_required" });
-    }
-
-    const inputs = body.products.length
-      ? body.products
-      : [...new Set(body.mlas.map(value => String(value).trim()))].map((mla, index) => ({ row_number: index + 1, mla }));
-    const batchIndex = Number(body.batch_index || 0);
-    const totalBatches = Number(body.total_batches || 0);
-    const totalProducts = Number(body.total_products || inputs.length);
-    const queued = await enqueuePersistentBatch({
-      jobId: body.job_id,
-      jobType: "mla_to_upc",
-      batchIndex,
-      totalBatches,
-      totalProducts,
-      payload: { products: inputs }
-    });
-
-    setImmediate(() => runBatchWorkerCycle().catch(() => {}));
-
-    return res.status(202).json({
-      ok: true,
-      accepted: true,
-      duplicate: queued.duplicate,
-      batch: {
-        batch_id: queued.batch.batch_id,
-        batch_index: Number(queued.batch.batch_index),
-        total_batches: Number(queued.batch.total_batches),
-        status: queued.batch.status
-      },
-      job: publicJob(await getPersistentJob(body.job_id))
-    });
-  } catch (error) {
-    logger.error({ error: error.message, codigo: error.code || "queue_error" }, "No se pudo encolar una tanda MLA a UPC");
-    return res.status(error.status && error.status >= 400 && error.status < 600 ? error.status : 500).json({
-      ok: false,
-      error: error.code || "queue_error",
-      message: error.message
-    });
-  }
-});
-
-app.post("/lookup-upcs", requireWpOrN8n, async (req, res) => {
-  try {
-    const parsed = upcLookupSchema.safeParse(req.body);
-
-    if (!parsed.success) {
-      return res.status(400).json({
-        ok: false,
-        error: "invalid_payload",
-        details: parsed.error.flatten()
-      });
-    }
-
-    const verification = await verifyMeliApiConnection(false);
-
-    if (!verification.ok) {
-      return res.status(503).json({
-        ok: false,
-        error: "meli_api_not_ready",
-        api_status: verification.status,
-        api_error: verification.error,
-        oauth_start_url: `${config.appBaseUrl}/auth/mercadolibre/start`
-      });
-    }
-
-    const body = parsed.data;
-    const inputs = body.products.length
-      ? body.products
-      : [...new Set(body.mlas.map(value => String(value).trim()))];
-    let job = body.job_id ? await getPersistentJob(body.job_id) : null;
-
-    if (body.job_id && !job) {
-      job = createEmptyJob({
-        job_id: body.job_id,
-        job_type: "mla_to_upc",
-        status: "processing",
-        total: Number(body.total_products || inputs.length)
-      });
-      job.started_at = nowIso();
-      jobs.set(job.job_id, job);
-      await saveJob(job);
-    }
-
-    if (job) {
-      job.job_type = "mla_to_upc";
-      job.status = "processing";
-      job.total = Number(body.total_products || job.total || inputs.length);
-      job.started_at = job.started_at || nowIso();
-      job.finished_at = null;
-      job.error = "";
-    }
-
-    const results = await mapWithConcurrency(inputs, config.productConcurrency, resolveUpcsByMla);
-    const apiErrors = results.filter(result => String(result.status || "").startsWith("api_")).length;
-    const summary = {
-      requested: inputs.length,
-      processed: results.length,
-      found: results.filter(result => result.status === "ok").length,
-      without_identifier: results.filter(result => ["identifier_not_available", "identifier_candidates", "partial_scan"].includes(result.status)).length,
-      with_candidates: results.filter(result => result.status === "identifier_candidates").length,
-      partial_scans: results.filter(result => result.status === "partial_scan").length,
-      invalid: results.filter(result => result.status === "invalid_mla").length,
-      not_found: results.filter(result => result.status === "item_not_found").length,
-      api_errors: apiErrors,
-      errors: results.filter(result => !["ok", "identifier_not_available", "identifier_candidates", "invalid_mla", "item_not_found"].includes(result.status)).length
-    };
-
-    if (job) {
-      job.processed += summary.processed;
-      job.ok += summary.found;
-      job.not_found += summary.not_found;
-      job.no_offers += summary.without_identifier;
-      job.api_errors += summary.api_errors;
-      job.errors += summary.errors;
-      await saveJob(job);
-    }
-
-    logger.info({
-      job_id: body.job_id || null,
-      indice_tanda: Number(body.batch_index || 0),
-      total_tandas: Number(body.total_batches || 0),
-      solicitados: summary.requested,
-      procesados: summary.processed,
-      identificadores_encontrados: summary.found,
-      sin_identificador: summary.without_identifier,
-      con_candidatos: summary.with_candidates,
-      recorridos_parciales: summary.partial_scans,
-      mla_invalidos: summary.invalid,
-      publicaciones_no_encontradas: summary.not_found,
-      errores: summary.errors
-    }, "Finalizó la consulta de UPC, EAN y GTIN por MLA");
-
-    return res.json({
-      ok: true,
-      job: job ? publicJob(job) : null,
-      summary,
-      results
-    });
-  } catch (error) {
-    logger.error({
-      codigo: error.code || "internal_error",
-      estado_http: error.status || null,
-      error: error.message
-    }, "Falló la consulta de identificadores por MLA");
-
-    return res.status(error.status && error.status >= 400 && error.status < 600 ? error.status : 500).json({
-      ok: false,
-      error: error.code || "internal_error",
-      message: error.message
-    });
-  }
-});
-
 app.post("/jobs", requireWp, async (req, res) => {
   try {
     const parsed = jobSchema.safeParse(req.body);
@@ -4013,6 +2368,7 @@ app.post("/jobs", requireWp, async (req, res) => {
     }
 
     const body = parsed.data;
+    const market = resolveMarket(body);
 
     if (!isGoogleSheetUrl(body.sheet_url)) {
       return res.status(400).json({
@@ -4044,7 +2400,8 @@ app.post("/jobs", requireWp, async (req, res) => {
       job_id: safeJobId(),
       job_type: "ean_to_mla",
       sheet_url: body.sheet_url,
-      sheet_name: body.sheet_name || "",
+      sheet_name: market.sheet_name,
+      site_id: market.site_id,
       email: body.email || "",
       status: "pending"
     });
@@ -4079,96 +2436,9 @@ app.post("/jobs", requireWp, async (req, res) => {
     });
   } catch (error) {
     logger.error({ error: error.message }, "Falló la creación del job");
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       ok: false,
-      error: "internal_error"
-    });
-  }
-});
-
-app.post("/upc-jobs", requireWp, async (req, res) => {
-  try {
-    const parsed = jobSchema.safeParse(req.body);
-
-    if (!parsed.success) {
-      return res.status(400).json({
-        ok: false,
-        error: "invalid_payload",
-        details: parsed.error.flatten()
-      });
-    }
-
-    const body = parsed.data;
-
-    if (!isGoogleSheetUrl(body.sheet_url)) {
-      return res.status(400).json({
-        ok: false,
-        error: "invalid_sheet_url"
-      });
-    }
-
-    if (config.requireApiPreflight) {
-      const verification = await verifyMeliApiConnection(true);
-
-      if (!verification.ok) {
-        logger.error({
-          estado_api: verification.status,
-          error_api: verification.error
-        }, "El job MLA a UPC fue rechazado porque la API de MercadoLibre no está disponible");
-
-        return res.status(503).json({
-          ok: false,
-          error: "meli_api_not_ready",
-          api_status: verification.status,
-          api_error: verification.error,
-          oauth_start_url: `${config.appBaseUrl}/auth/mercadolibre/start`
-        });
-      }
-    }
-
-    const job = createEmptyJob({
-      job_id: safeJobId(),
-      job_type: "mla_to_upc",
-      sheet_url: body.sheet_url,
-      sheet_name: body.sheet_name || "",
-      email: body.email || "",
-      status: "pending"
-    });
-
-    jobs.set(job.job_id, job);
-    await saveJob(job);
-
-    try {
-      await notifyN8nJobCreated(job);
-      job.status = "sent_to_n8n";
-      await saveJob(job);
-    } catch (error) {
-      job.status = "n8n_error";
-      job.error = error.message;
-      await saveJob(job);
-      logger.error({ job_id: job.job_id, error: error.message }, "No se pudo iniciar el workflow MLA a UPC de n8n");
-      return res.status(502).json({
-        ok: false,
-        error: "n8n_webhook_failed",
-        job: publicJob(job)
-      });
-    }
-
-    logger.info({
-      job_id: job.job_id,
-      job_type: job.job_type,
-      sheet_name: job.sheet_name
-    }, "El job MLA a UPC fue creado y enviado a n8n");
-
-    return res.json({
-      ok: true,
-      job: publicJob(job)
-    });
-  } catch (error) {
-    logger.error({ error: error.message }, "Falló la creación del job MLA a UPC");
-    return res.status(500).json({
-      ok: false,
-      error: "internal_error"
+      error: error.code || "internal_error"
     });
   }
 });
@@ -4231,10 +2501,13 @@ app.post("/monitor", requireN8n, async (req, res) => {
     }
 
     let job = await getPersistentJob(body.job_id);
+    const market = resolveMarket({ sheet_name: job?.sheet_name, site_id: body.site_id || job?.site_id });
+    if (job && job.site_id !== market.site_id) throw apiError("El país no coincide con el trabajo", { code: "job_site_conflict", status: 409 });
 
     if (!job) {
       job = createEmptyJob({
         job_id: body.job_id,
+        site_id: market.site_id,
         status: "processing",
         total: Number(body.total_products || body.products.length)
       });
@@ -4265,7 +2538,7 @@ app.post("/monitor", requireN8n, async (req, res) => {
 
     const results = await mapWithConcurrency(body.products, config.productConcurrency, async row => {
       try {
-        return await resolveProduct(row);
+        return await resolveProduct(row, market.site_id);
       } catch (error) {
         const ean = normalizeEan(row.ean);
         logger.error({
@@ -4518,7 +2791,7 @@ app.post("/debug/resolve", async (req, res) => {
       name: req.body.name || ""
     };
 
-    const result = await resolveProduct(row);
+    const result = await resolveProduct(row, req.body.site_id || config.meliSiteId);
 
     return res.status(["ok", "partial_ok"].includes(result.status) ? 200 : 404).json({
       ok: ["ok", "partial_ok"].includes(result.status),
@@ -4587,7 +2860,6 @@ async function startService() {
       tamano_pagina_catalogo: config.catalogItemsPageSize,
       maximo_paginas_catalogo: config.maxCatalogItemPages,
       cache_resultados_exitosos: config.cacheSuccessfulResults,
-      logs_muestra_catalogo: config.logCatalogSamples,
       anticipacion_renovacion_ms: config.tokenRefreshLeadMs,
       intervalo_revision_token_ms: config.tokenCheckIntervalMs
     }, "Microservicio iniciado con cola persistente de PostgreSQL");

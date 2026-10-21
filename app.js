@@ -1792,7 +1792,9 @@ function buildCatalogOnlyResult(row, ean, data) {
 
     source: data.source || "catalog_items_api",
     status: "catalog_only",
-    error: "MercadoLibre informó publicaciones asociadas, pero no expuso un precio utilizable",
+    error: data.item_id
+      ? "MercadoLibre informó publicaciones asociadas, pero no expuso un precio utilizable"
+      : "Producto de catálogo identificado, sin publicaciones asociadas actualmente",
     api_http_status: 200,
     api_endpoint: data.api_endpoint || null,
     retryable: false,
@@ -2117,8 +2119,12 @@ async function resolveProduct(row, siteId = config.meliSiteId) {
     });
   }
 
-  return resultError(row, ean, "offers_not_found", "MercadoLibre reconoció el producto, pero no informó publicaciones asociadas", {
+  // Conservar el producto de catálogo aunque no tenga publicaciones actuales.
+  // n8n ya procesa el estado catalog_only y escribe MLA Catalog sin requerir precio ni item_id.
+  return buildCatalogOnlyResult(row, ean, {
     catalog_product_id: catalogProductId,
+    item_id: null,
+    source: "catalog_products_api",
     api_endpoint: offersEndpoint
   });
 }

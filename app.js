@@ -68,6 +68,14 @@ const config = {
   tokenCheckIntervalMs: Number(process.env.MELI_TOKEN_CHECK_INTERVAL_MS || 1000 * 60 * 10)
 };
 
+// El modo GLOBAL es un identificador interno del trabajo, no un site_id de la API de Mercado Libre.
+const GLOBAL_SITE_ID = "GLOBAL";
+const GLOBAL_SHEET_NAME = "UPC_GLOBAL";
+const GLOBAL_CURRENCY_ID = "MULTI";
+const NATIONAL_JOB_TYPE = "ean_to_mla";
+const GLOBAL_JOB_TYPE = "ean_global";
+const SUPPORTED_JOB_TYPES = [NATIONAL_JOB_TYPE, GLOBAL_JOB_TYPE];
+
 const marketSites = {
   MLA: { sheet_name: "UPC_ARG", currency_id: "ARS", auth_base: "https://auth.mercadolibre.com.ar" },
   MLM: { sheet_name: "UPC_MEX", currency_id: "MXN", auth_base: "https://auth.mercadolibre.com.mx" },
@@ -76,16 +84,37 @@ const marketSites = {
   MLB: { sheet_name: "UPC_BRA", currency_id: "BRL", auth_base: "https://auth.mercadolivre.com.br" }
 };
 
+const globalSites = Object.keys(marketSites);
+
 function resolveMarket(data = {}) {
   const sheetName = String(data.sheet_name || "").trim();
-  const fromSheet = Object.keys(marketSites).find(id => marketSites[id].sheet_name === sheetName);
+  const fromSheet = globalSites.find(id => marketSites[id].sheet_name === sheetName);
   const explicitSite = String(data.site_id || "").trim().toUpperCase();
+  const isGlobalSheet = sheetName === GLOBAL_SHEET_NAME;
+  const isGlobalSite = explicitSite === GLOBAL_SITE_ID;
+
+  if (isGlobalSheet || isGlobalSite) {
+    if ((isGlobalSheet && explicitSite && !isGlobalSite) || (isGlobalSite && sheetName && !isGlobalSheet)) {
+      throw apiError("La pestaña UPC_GLOBAL requiere el modo GLOBAL", { code: "sheet_site_mismatch", status: 400 });
+    }
+    return { site_id: GLOBAL_SITE_ID, currency_id: GLOBAL_CURRENCY_ID, sheet_name: GLOBAL_SHEET_NAME };
+  }
+
   const siteId = explicitSite || fromSheet || String(config.meliSiteId).trim().toUpperCase();
   if (!marketSites[siteId]) throw apiError("País no soportado", { code: "invalid_site_id", status: 400 });
   if (fromSheet && explicitSite && fromSheet !== explicitSite) {
     throw apiError("El país no coincide con la pestaña", { code: "sheet_site_mismatch", status: 400 });
   }
   return { site_id: siteId, currency_id: marketSites[siteId].currency_id, sheet_name: sheetName || marketSites[siteId].sheet_name };
+}
+
+function assertJobMode(jobType, market) {
+  if (!SUPPORTED_JOB_TYPES.includes(jobType)) {
+    throw apiError("Tipo de trabajo no soportado", { code: "unsupported_job_type", status: 400 });
+  }
+  if ((jobType === GLOBAL_JOB_TYPE) !== (market.site_id === GLOBAL_SITE_ID)) {
+    throw apiError("El tipo de trabajo no coincide con el mercado", { code: "job_site_conflict", status: 409 });
+  }
 }
 
 const jobs = new Map();
@@ -151,7 +180,8 @@ app.use(rateLimit({
 const jobSchema = z.object({
   sheet_url: z.string().min(10).max(1000),
   sheet_name: z.string().min(1).max(100).optional().default(""),
-  site_id: z.enum(["MLA", "MLM", "MCO", "MLC", "MLB"]).optional(),
+  site_id: z.enum(["MLA", "MLM", "MCO", "MLC", "MLB", "GLOBAL"]).optional(),
+  job_type: z.enum([NATIONAL_JOB_TYPE, GLOBAL_JOB_TYPE]).optional(),
   email: z.string().email().optional().or(z.literal(""))
 });
 
@@ -165,7 +195,8 @@ const productSchema = z.object({
 const monitorSchema = z.object({
   job_id: z.string().min(8).max(100),
   products: z.array(productSchema).min(1),
-  site_id: z.enum(["MLA", "MLM", "MCO", "MLC", "MLB"]).optional(),
+  site_id: z.enum(["MLA", "MLM", "MCO", "MLC", "MLB", "GLOBAL"]).optional(),
+  job_type: z.enum([NATIONAL_JOB_TYPE, GLOBAL_JOB_TYPE]).optional(),
   total_products: z.union([z.string(), z.number()]).optional(),
   batch_index: z.union([z.string(), z.number()]).optional(),
   total_batches: z.union([z.string(), z.number()]).optional()
@@ -179,7 +210,7 @@ const callbackSchema = z.object({
 });
 
 const testProductSchema = z.object({
-  site_id: z.enum(["MLA", "MLM", "MCO", "MLC", "MLB"]).optional(),
+  site_id: z.enum(["MLA", "MLM", "MCO", "MLC", "MLB", "GLOBAL"]).optional(),
   ean: z.union([z.string(), z.number()]),
   brand: z.string().optional().default(""),
   name: z.string().optional().default("")
@@ -234,11 +265,13 @@ function publicJob(job) {
 
 function createEmptyJob(data) {
   const market = resolveMarket(data);
+  const jobType = data.job_type || (market.site_id === GLOBAL_SITE_ID ? GLOBAL_JOB_TYPE : NATIONAL_JOB_TYPE);
+  assertJobMode(jobType, market);
   return {
     job_id: data.job_id,
-    job_type: data.job_type || "ean_to_mla",
+    job_type: jobType,
     sheet_url: data.sheet_url || "",
-    sheet_name: data.sheet_name || "",
+    sheet_name: data.sheet_name || (market.site_id === GLOBAL_SITE_ID ? GLOBAL_SHEET_NAME : ""),
     site_id: market.site_id,
     currency_id: market.currency_id,
     email: data.email || "",
@@ -555,7 +588,11 @@ async function enqueuePersistentBatch({ jobId, jobType, batchIndex, totalBatches
   }
 
   const existingJob = await getPersistentJob(jobId);
-  const market = resolveMarket({ sheet_name: existingJob?.sheet_name, site_id: payload.site_id || existingJob?.site_id });
+  const market = resolveMarket({
+    sheet_name: existingJob?.sheet_name,
+    site_id: payload.site_id || existingJob?.site_id || (jobType === GLOBAL_JOB_TYPE ? GLOBAL_SITE_ID : "")
+  });
+  assertJobMode(jobType, market);
   payload = { ...payload, site_id: market.site_id };
   const job = await ensurePersistentJobForBatch(jobId, jobType, totalProducts, totalBatches, market.site_id);
   const hash = payloadHash(payload);
@@ -674,28 +711,33 @@ async function processQueuedBatch(batch) {
       });
     }
 
-    if (batch.job_type !== "ean_to_mla") {
+    if (!SUPPORTED_JOB_TYPES.includes(batch.job_type)) {
       throw apiError("Tipo de trabajo no soportado", { code: "unsupported_job_type", status: 400 });
     }
     const payload = batch.payload || {};
     const job = await getPersistentJob(batch.job_id);
     const market = resolveMarket({ sheet_name: job?.sheet_name, site_id: payload.site_id || job?.site_id });
+    assertJobMode(batch.job_type, market);
     const inputs = Array.isArray(payload.products) ? payload.products : [];
     const results = await mapWithConcurrency(inputs, config.productConcurrency, async row => {
-        try {
-          return await resolveProduct(row, market.site_id);
-        } catch (error) {
-          const ean = normalizeEan(row.ean);
-          logger.error({
-            job_id: batch.job_id,
-            batch_id: batch.batch_id,
-            row_number: row.row_number,
-            ean,
-            error: error.message
-          }, "Falló inesperadamente el procesamiento de un producto en background");
-          return resultError(row, ean, "unexpected_error", error.message);
-        }
-      });
+      try {
+        return batch.job_type === GLOBAL_JOB_TYPE
+          ? await resolveGlobalProduct(row)
+          : await resolveProduct(row, market.site_id);
+      } catch (error) {
+        const ean = normalizeEan(row.ean);
+        logger.error({
+          job_id: batch.job_id,
+          batch_id: batch.batch_id,
+          row_number: row.row_number,
+          ean,
+          error: error.message
+        }, "Falló inesperadamente el procesamiento de un producto en background");
+        return batch.job_type === GLOBAL_JOB_TYPE
+          ? globalFailureResult(row, "unexpected_error", error.message)
+          : resultError(row, ean, "unexpected_error", error.message);
+      }
+    });
     const summary = countBatchResults(results);
 
     await dbPool.query(`
@@ -811,8 +853,8 @@ async function deliverBatchCallback(batch) {
       total_products: Number(batch.total_products),
       sheet_url: job.sheet_url,
       sheet_name: job.sheet_name,
-    site_id: job.site_id,
-    currency_id: job.currency_id,
+      site_id: job.site_id,
+      currency_id: job.currency_id,
       batch_summary: batch.summary || {},
       results: Array.isArray(batch.results) ? batch.results : [],
       processed_at: dateToIso(batch.processed_at)
@@ -2129,6 +2171,105 @@ async function resolveProduct(row, siteId = config.meliSiteId) {
   });
 }
 
+// Resultado de un UPC en los cinco mercados. Los precios NO se comparan entre
+// monedas: se devuelve el menor precio válido por país, en su moneda local.
+function globalFailureResult(row, status, message) {
+  const ean = normalizeEan(row.ean);
+  const countryResults = {};
+  for (const siteId of globalSites) {
+    countryResults[siteId] = {
+      ...resultError(row, ean, status, message),
+      site_id: siteId,
+      currency_id: marketSites[siteId].currency_id
+    };
+  }
+  return {
+    row_number: row.row_number,
+    ean,
+    status,
+    error: String(message || "").slice(0, 500),
+    country_results: countryResults,
+    country_summary: {
+      total: globalSites.length,
+      with_price: 0,
+      catalog_only: 0,
+      product_not_found: 0,
+      api_errors: status.startsWith("api_") ? globalSites.length : 0,
+      other_errors: status.startsWith("api_") || status === "invalid_ean" ? 0 : globalSites.length
+    },
+    checked_at: nowIso()
+  };
+}
+
+async function resolveGlobalProduct(row) {
+  const ean = normalizeEan(row.ean);
+  if (!isValidEan(ean)) {
+    return globalFailureResult(row, "invalid_ean", "EAN inválido");
+  }
+
+  // Limitar el paralelismo dentro de cada UPC. El Bottleneck existente aplica
+  // el límite final de peticiones a la API, compartido con los trabajos nacionales.
+  const siteResults = await mapWithConcurrency(globalSites, Math.min(2, config.productConcurrency), async siteId => {
+    try {
+      const result = await resolveProduct(row, siteId);
+      return {
+        ...result,
+        site_id: siteId,
+        currency_id: marketSites[siteId].currency_id
+      };
+    } catch (error) {
+      logger.error({ site_id: siteId, row_number: row.row_number, ean, error: error.message },
+        "Fallo inesperado consultando un país durante la búsqueda global");
+      return {
+        ...resultError(row, ean, error.code || "unexpected_error", error.message),
+        site_id: siteId,
+        currency_id: marketSites[siteId].currency_id
+      };
+    }
+  });
+
+  const countryResults = Object.fromEntries(siteResults.map(result => [result.site_id, result]));
+  const withPrice = siteResults.filter(result =>
+    ["ok", "partial_ok"].includes(result.status) &&
+    Number.isFinite(Number(result.min_price)) && Number(result.min_price) > 0
+  ).length;
+  const catalogOnly = siteResults.filter(result => result.status === "catalog_only").length;
+  const notFound = siteResults.filter(result => result.status === "product_not_found").length;
+  const apiErrors = siteResults.filter(result => String(result.status || "").startsWith("api_")).length;
+  const otherErrors = siteResults.filter(result =>
+    !["ok", "partial_ok", "catalog_only", "product_not_found", "offers_not_found"].includes(result.status) &&
+    !String(result.status || "").startsWith("api_")
+  ).length;
+
+  let status;
+  if (withPrice === globalSites.length) status = "ok";
+  else if (withPrice > 0) status = "partial_ok";
+  else if (apiErrors > 0) status = "api_error";
+  else if (catalogOnly > 0) status = "catalog_only";
+  else if (notFound === globalSites.length) status = "product_not_found";
+  else if (otherErrors > 0) status = "other_error";
+  else status = "offers_not_found";
+
+  return {
+    row_number: row.row_number,
+    ean,
+    status,
+    error: apiErrors > 0 && withPrice === 0
+      ? "No se pudo obtener un precio; revisar los errores de los países"
+      : "",
+    country_results: countryResults,
+    country_summary: {
+      total: globalSites.length,
+      with_price: withPrice,
+      catalog_only: catalogOnly,
+      product_not_found: notFound,
+      api_errors: apiErrors,
+      other_errors: otherErrors
+    },
+    checked_at: nowIso()
+  };
+}
+
 async function notifyN8nJobCreated(job) {
   if (!config.n8nWebhookUrl) {
     throw new Error("missing_n8n_webhook_url");
@@ -2226,7 +2367,9 @@ app.get("/", (req, res) => {
     oauth_start: "/auth/mercadolibre/start",
     ean_job_start: "/jobs",
     ean_queue: "/monitor/queue",
-    supported_sites: Object.keys(marketSites)
+    supported_sites: globalSites,
+    global_sheet: GLOBAL_SHEET_NAME,
+    supported_job_types: SUPPORTED_JOB_TYPES
   });
 });
 
@@ -2300,12 +2443,15 @@ app.post("/meli/test-product", requireN8n, async (req, res) => {
     });
   }
 
-  const result = await resolveProduct({
+  const testRow = {
     row_number: 1,
     ean: parsed.data.ean,
     brand: parsed.data.brand,
     name: parsed.data.name
-  }, parsed.data.site_id || config.meliSiteId);
+  };
+  const result = parsed.data.site_id === GLOBAL_SITE_ID
+    ? await resolveGlobalProduct(testRow)
+    : await resolveProduct(testRow, parsed.data.site_id || config.meliSiteId);
 
   return res.status(["ok", "partial_ok"].includes(result.status) ? 200 : 404).json({
     ok: ["ok", "partial_ok"].includes(result.status),
@@ -2325,12 +2471,15 @@ app.post("/monitor/queue", requireN8n, async (req, res) => {
       return res.status(400).json({ ok: false, error: "too_many_products", max: config.maxProductsPerRequest });
     }
 
+    const existingJob = await getPersistentJob(body.job_id);
+    const jobType = body.job_type || existingJob?.job_type ||
+      (body.site_id === GLOBAL_SITE_ID ? GLOBAL_JOB_TYPE : NATIONAL_JOB_TYPE);
     const batchIndex = Number(body.batch_index || 0);
     const totalBatches = Number(body.total_batches || 0);
     const totalProducts = Number(body.total_products || body.products.length);
     const queued = await enqueuePersistentBatch({
       jobId: body.job_id,
-      jobType: "ean_to_mla",
+      jobType,
       batchIndex,
       totalBatches,
       totalProducts,
@@ -2375,6 +2524,8 @@ app.post("/jobs", requireWp, async (req, res) => {
 
     const body = parsed.data;
     const market = resolveMarket(body);
+    const jobType = body.job_type || (market.site_id === GLOBAL_SITE_ID ? GLOBAL_JOB_TYPE : NATIONAL_JOB_TYPE);
+    assertJobMode(jobType, market);
 
     if (!isGoogleSheetUrl(body.sheet_url)) {
       return res.status(400).json({
@@ -2404,7 +2555,7 @@ app.post("/jobs", requireWp, async (req, res) => {
 
     const job = createEmptyJob({
       job_id: safeJobId(),
-      job_type: "ean_to_mla",
+      job_type: jobType,
       sheet_url: body.sheet_url,
       sheet_name: market.sheet_name,
       site_id: market.site_id,
@@ -2507,12 +2658,21 @@ app.post("/monitor", requireN8n, async (req, res) => {
     }
 
     let job = await getPersistentJob(body.job_id);
-    const market = resolveMarket({ sheet_name: job?.sheet_name, site_id: body.site_id || job?.site_id });
-    if (job && job.site_id !== market.site_id) throw apiError("El país no coincide con el trabajo", { code: "job_site_conflict", status: 409 });
+    const jobType = body.job_type || job?.job_type ||
+      (body.site_id === GLOBAL_SITE_ID ? GLOBAL_JOB_TYPE : NATIONAL_JOB_TYPE);
+    const market = resolveMarket({
+      sheet_name: job?.sheet_name,
+      site_id: body.site_id || job?.site_id || (jobType === GLOBAL_JOB_TYPE ? GLOBAL_SITE_ID : "")
+    });
+    assertJobMode(jobType, market);
+    if (job && (job.site_id !== market.site_id || job.job_type !== jobType)) {
+      throw apiError("El país o tipo de trabajo no coincide con el trabajo", { code: "job_site_conflict", status: 409 });
+    }
 
     if (!job) {
       job = createEmptyJob({
         job_id: body.job_id,
+        job_type: jobType,
         site_id: market.site_id,
         status: "processing",
         total: Number(body.total_products || body.products.length)
@@ -2544,7 +2704,9 @@ app.post("/monitor", requireN8n, async (req, res) => {
 
     const results = await mapWithConcurrency(body.products, config.productConcurrency, async row => {
       try {
-        return await resolveProduct(row, market.site_id);
+        return jobType === GLOBAL_JOB_TYPE
+          ? await resolveGlobalProduct(row)
+          : await resolveProduct(row, market.site_id);
       } catch (error) {
         const ean = normalizeEan(row.ean);
         logger.error({
@@ -2553,7 +2715,9 @@ app.post("/monitor", requireN8n, async (req, res) => {
           ean,
           error: error.message
         }, "Falló inesperadamente el procesamiento de un producto");
-        return resultError(row, ean, "unexpected_error", error.message);
+        return jobType === GLOBAL_JOB_TYPE
+          ? globalFailureResult(row, "unexpected_error", error.message)
+          : resultError(row, ean, "unexpected_error", error.message);
       }
     });
 
@@ -2797,7 +2961,9 @@ app.post("/debug/resolve", async (req, res) => {
       name: req.body.name || ""
     };
 
-    const result = await resolveProduct(row, req.body.site_id || config.meliSiteId);
+    const result = req.body.site_id === GLOBAL_SITE_ID
+      ? await resolveGlobalProduct(row)
+      : await resolveProduct(row, req.body.site_id || config.meliSiteId);
 
     return res.status(["ok", "partial_ok"].includes(result.status) ? 200 : 404).json({
       ok: ["ok", "partial_ok"].includes(result.status),

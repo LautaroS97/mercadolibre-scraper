@@ -1,4 +1,3 @@
-/*app.js*/
 require("dotenv").config();
 
 const express = require("express");
@@ -1606,6 +1605,12 @@ function normalizeItemId(value) {
   return match ? match[0].toUpperCase() : "";
 }
 
+// El CBT de publicación solo se utiliza cuando la API devuelve el ID explícitamente.
+function normalizeCbtItemId(value) {
+  const id = String(value || "").trim().toUpperCase();
+  return /^CBT\d{5,}$/.test(id) ? id : "";
+}
+
 function getPath(object, path) {
   if (!object || typeof object !== "object") return undefined;
   const parts = Array.isArray(path) ? path : String(path).split(".");
@@ -2172,6 +2177,45 @@ async function resolveProduct(row, siteId = config.meliSiteId) {
   });
 }
 
+// Intenta obtener el CBT de las publicaciones ya halladas para UPC_GLOBAL.
+// Si la API no devuelve un CBT consultable, devuelve un ID nacional existente.
+// Este enriquecimiento no puede bloquear la búsqueda ni alterar los precios.
+async function resolveGlobalCbtWithFallback(siteResults) {
+  const itemIds = [...new Set(siteResults
+    .map(result => normalizeItemId(result.item_id))
+    .filter(Boolean))];
+  const fallbackItemId = itemIds[0] || "";
+
+  for (const itemId of itemIds) {
+    const cacheKey = `cbt-by-marketplace-item:${itemId}`;
+    const cached = cacheGet(cacheKey);
+    if (cached !== null) {
+      if (cached.cbt) return cached.cbt;
+      continue;
+    }
+
+    try {
+      const details = await meliRequest(`/marketplace/items/${itemId}`, {
+        operation: "obtener_cbt_de_publicacion",
+        maxRetries: 0
+      });
+      const cbt = normalizeCbtItemId(details?.cbt_item_id);
+      cacheSet(cacheKey, { cbt });
+      if (cbt) return cbt;
+    } catch (error) {
+      const status = Number(error.status || 0);
+      // 403/404 no impiden seguir consultando otras publicaciones.
+      if ([400, 403, 404].includes(status)) cacheSet(cacheKey, { cbt: "" });
+      logger.warn({ item_id: itemId, estado_http: status || null, codigo: error.code || "api_error" },
+        "No se obtuvo CBT; se conservará la alternativa nacional si corresponde");
+      // Si hay un error global de autenticación o de límite, no insistir.
+      if ([401, 429].includes(status)) break;
+    }
+  }
+
+  return fallbackItemId;
+}
+
 // Resultado de un UPC en los cinco mercados. Los precios NO se comparan entre
 // monedas: se devuelve el menor precio válido por país, en su moneda local.
 function globalFailureResult(row, status, message) {
@@ -2189,6 +2233,7 @@ function globalFailureResult(row, status, message) {
     ean,
     status,
     error: String(message || "").slice(0, 500),
+    cbt: "",
     country_results: countryResults,
     country_summary: {
       total: globalSites.length,
@@ -2230,6 +2275,7 @@ async function resolveGlobalProduct(row) {
   });
 
   const countryResults = Object.fromEntries(siteResults.map(result => [result.site_id, result]));
+  const cbt = await resolveGlobalCbtWithFallback(siteResults);
   const withPrice = siteResults.filter(result =>
     ["ok", "partial_ok"].includes(result.status) &&
     Number.isFinite(Number(result.min_price)) && Number(result.min_price) > 0
@@ -2258,6 +2304,7 @@ async function resolveGlobalProduct(row) {
     error: apiErrors > 0 && withPrice === 0
       ? "No se pudo obtener un precio; revisar los errores de los países"
       : "",
+    cbt,
     country_results: countryResults,
     country_summary: {
       total: globalSites.length,

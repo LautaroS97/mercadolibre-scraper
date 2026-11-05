@@ -2177,20 +2177,26 @@ async function resolveProduct(row, siteId = config.meliSiteId) {
   });
 }
 
-// Intenta obtener el CBT de las publicaciones ya halladas para UPC_GLOBAL.
-// Si la API no devuelve un CBT consultable, devuelve un ID nacional existente.
+// Para UPC_GLOBAL, prioriza el CBT de publicación devuelto por la API.
+// Si no está disponible, usa el identificador del catálogo argentino (MLA Catalog),
+// NUNCA el ID de la publicación (item_id). En ambos casos entrega solo dígitos.
 // Este enriquecimiento no puede bloquear la búsqueda ni alterar los precios.
 async function resolveGlobalCbtWithFallback(siteResults) {
+  const argentina = siteResults.find(result => result.site_id === "MLA");
+  const argCatalogId = normalizeCatalogId(argentina?.catalog_product_id);
+  const fallbackCatalogDigits = /^MLA\d{5,}$/.test(argCatalogId)
+    ? argCatalogId.slice(3)
+    : "";
   const itemIds = [...new Set(siteResults
     .map(result => normalizeItemId(result.item_id))
     .filter(Boolean))];
-  const fallbackItemId = itemIds[0] || "";
 
   for (const itemId of itemIds) {
     const cacheKey = `cbt-by-marketplace-item:${itemId}`;
     const cached = cacheGet(cacheKey);
     if (cached !== null) {
-      if (cached.cbt) return cached.cbt;
+      const cachedCbt = normalizeCbtItemId(cached.cbt);
+      if (cachedCbt) return cachedCbt.slice(3);
       continue;
     }
 
@@ -2201,19 +2207,19 @@ async function resolveGlobalCbtWithFallback(siteResults) {
       });
       const cbt = normalizeCbtItemId(details?.cbt_item_id);
       cacheSet(cacheKey, { cbt });
-      if (cbt) return cbt;
+      if (cbt) return cbt.slice(3);
     } catch (error) {
       const status = Number(error.status || 0);
       // 403/404 no impiden seguir consultando otras publicaciones.
       if ([400, 403, 404].includes(status)) cacheSet(cacheKey, { cbt: "" });
       logger.warn({ item_id: itemId, estado_http: status || null, codigo: error.code || "api_error" },
-        "No se obtuvo CBT; se conservará la alternativa nacional si corresponde");
+        "No se obtuvo CBT; se utilizará MLA Catalog si está disponible");
       // Si hay un error global de autenticación o de límite, no insistir.
       if ([401, 429].includes(status)) break;
     }
   }
 
-  return fallbackItemId;
+  return fallbackCatalogDigits;
 }
 
 // Resultado de un UPC en los cinco mercados. Los precios NO se comparan entre
